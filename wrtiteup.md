@@ -1,12 +1,13 @@
-# Building High-Performance Sparse FP8 Attention on Ada Lovelace: An In-Depth Engineering Journey with NVIDIA CuTe DSL & Raw CUDA C++
+# Building High-Performance Sparse FP8 Attention on Ada Lovelace: An In-Depth Engineering Journey with NVIDIA CuTe DSL, Raw CUDA C++, and Modular Mojo / MAX
 
 **Author**: Ammar Alnagar  
 **Date**: October 2026  
 **Hardware Target**: NVIDIA GeForce RTX 4060 Laptop GPU (24 SMs, Ada Lovelace sm_89, 8 GB VRAM, 115W TGP, 128-bit Bus)  
-**Software Stack**: NVIDIA CuTe DSL (`nvidia-cutlass-dsl 4.8.1`), CUDA 13.4 (`nvcc`), PyTorch 2.x  
+**Software Stack**: NVIDIA CuTe DSL (`nvidia-cutlass-dsl 4.8.1`), CUDA 13.4 (`nvcc`), Modular Mojo 1.1.0 / MAX 26.6.0, PyTorch 2.x  
 **Artifacts**:
 * Optimized CuTe DSL Kernel: [`sm89_cutedsl.py`](file:///home/ammar/work/QSA-P8-SM89/sm89_cutedsl.py)
 * Raw CUDA C++ Optimized Kernel: [`sm89_cuda.cu`](file:///home/ammar/work/QSA-P8-SM89/sm89_cuda.cu)
+* Modular Mojo / MAX SM89 Kernel: [`sm89_mojo.mojo`](file:///home/ammar/work/QSA-P8-SM89/sm89_mojo.mojo)
 * Baseline Reference Kernel: [`backup.py`](file:///home/ammar/work/QSA-P8-SM89/backup.py)
 * Optimized CuTe DSL NCU Artifact: [`qsa_sm89_cutedsl.ncu-rep`](file:///home/ammar/work/QSA-P8-SM89/qsa_sm89_cutedsl.ncu-rep)
 * Raw CUDA C++ NCU Artifact: [`qsa_sm89_raw_cuda.ncu-rep`](file:///home/ammar/work/QSA-P8-SM89/qsa_sm89_raw_cuda.ncu-rep)
@@ -445,7 +446,202 @@ out[row, head, d3] = cutlass.BFloat16(ctx3 * sig3)
 
 ## 6. The Bare-Metal Raw CUDA C++ Port ([`sm89_cuda.cu`](file:///home/ammar/work/QSA-P8-SM89/sm89_cuda.cu))
 
-To push Ada Lovelace SM89 to its absolute physical performance ceiling, we also implemented a standalone native C++ CUDA kernel in [`sm89_cuda.cu`](file:///home/ammar/work/QSA-P8-SM89/sm89_cuda.cu).
+To push Ada Lovelace SM89 to its absolute physical performance ceiling and establish the upper bound of single-kernel performance, we developed a native, bare-metal C++ CUDA kernel in [`sm89_cuda.cu`](file:///home/ammar/work/QSA-P8-SM89/sm89_cuda.cu).
+
+### Complete Kernel Implementation (`sm89_cuda.cu`):
+
+```cuda
+#include <cuda_runtime.h>
+#include <cuda_fp8.h>
+#include <cuda_bf16.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <math.h>
+
+// ── Default Workload Parameters (Production Scaled Test) ─────────────────────
+#define DEFAULT_NUM_REQUESTS 64
+#define DEFAULT_NUM_Q_HEADS  32
+#define DEFAULT_NUM_KV_HEADS 8
+#define DEFAULT_GROUP_SIZE   (DEFAULT_NUM_Q_HEADS / DEFAULT_NUM_KV_HEADS) // 4
+#define DEFAULT_HEAD_DIM     128
+#define DEFAULT_PAGE_SIZE    16
+#define DEFAULT_MAX_PAGES    512
+#define DEFAULT_TOPK         512
+#define DEFAULT_BLOCK_N      32
+
+// ── Hardware FP8 Unpacking Intrinsics ───────────────────────────────────────
+// Converts 4 contiguous FP8-e4m3fn bytes inside a 32-bit register to 4 float32 registers
+// using two native SM89 hardware instructions (cvt.rn.f16x2.e4m3x2).
+__device__ __forceinline__ void fp8x4_to_float4(
+    uint32_t u32_val,
+    float& f0, float& f1, float& f2, float& f3
+) {
+    uint16_t lo = static_cast<uint16_t>(u32_val & 0xFFFF);
+    uint16_t hi = static_cast<uint16_t>(u32_val >> 16);
+
+    uint32_t h2_lo, h2_hi;
+    // Native Ada Lovelace SM89 hardware converter instruction:
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h2_lo) : "h"(lo));
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h2_hi) : "h"(hi));
+
+    float2 fl = __half22float2(*reinterpret_cast<const __half2*>(&h2_lo));
+    float2 fh = __half22float2(*reinterpret_cast<const __half2*>(&h2_hi));
+    f0 = fl.x;
+    f1 = fl.y;
+    f2 = fh.x;
+    f3 = fh.y;
+}
+
+// ── Warp Butterfly Reduction ────────────────────────────────────────────────
+// Reduces a float value across all 32 lanes in a single warp in 5 clock cycles
+// using the register datapath. No shared memory or barriers required.
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
+    }
+    return val;
+}
+
+// ── Raw CUDA C++ GQA Kernel ──────────────────────────────────────────────────
+// Grid:  [num_requests, num_kv_heads, 1]
+// Block: [128, 1, 1] (4 warps = 4 GQA query heads)
+extern "C" __global__ void qsa_sm89_gqa_cuda_kernel(
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_fp8_e4m3* __restrict__ k,
+    const __nv_fp8_e4m3* __restrict__ v,
+    const int32_t* __restrict__ indices,
+    const int32_t* __restrict__ btable,
+    const int32_t* __restrict__ t2r,
+    const __nv_bfloat16* __restrict__ gate,
+    __nv_bfloat16* __restrict__ out,
+    float softmax_scale,
+    float v_scale,
+    int32_t nblocks,
+    int32_t nreqs,
+    int32_t num_q_heads,
+    int32_t num_kv_heads,
+    int32_t topk,
+    int32_t page_sz,
+    int32_t max_pages,
+    int32_t head_dim,
+    int32_t group_sz
+) {
+    int row = blockIdx.x;
+    int kv_head = blockIdx.y;
+    int tid = threadIdx.x;
+
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+    int q_head = kv_head * group_sz + warp_id;
+
+    int req = t2r[row];
+    if (req < 0 || req >= nreqs) return;
+
+    int vc = indices[row * (topk + 1) + topk];
+    if (vc > topk) vc = topk;
+    if (vc <= 0) return;
+
+    // Each thread in the warp handles 4 coordinates: [4l, 4l+1, 4l+2, 4l+3]
+    int d0 = lane_id * 4;
+    size_t q_offset = (size_t)row * (num_q_heads * head_dim) + (size_t)q_head * head_dim + d0;
+
+    // Load query using vectorized 64-bit load (4 x bfloat16 = 8 bytes)
+    uint64_t q_u64 = *reinterpret_cast<const uint64_t*>(&q[q_offset]);
+    __nv_bfloat162 q_lo = *reinterpret_cast<const __nv_bfloat162*>(&q_u64);
+    __nv_bfloat162 q_hi = *(reinterpret_cast<const __nv_bfloat162*>(&q_u64) + 1);
+    float qd0 = __bfloat162float(q_lo.x);
+    float qd1 = __bfloat162float(q_lo.y);
+    float qd2 = __bfloat162float(q_hi.x);
+    float qd3 = __bfloat162float(q_hi.y);
+
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    float nm = 0.0f;
+    float mx = -1e20f;
+
+    size_t stride_blk = (size_t)page_sz * num_kv_heads * head_dim;
+    size_t stride_po  = (size_t)num_kv_heads * head_dim;
+    size_t stride_kv  = (size_t)kv_head * head_dim;
+
+    int ntiles = (vc + DEFAULT_BLOCK_N - 1) / DEFAULT_BLOCK_N;
+
+    for (int tile = 0; tile < ntiles; ++tile) {
+        #pragma unroll 4
+        for (int n = 0; n < DEFAULT_BLOCK_N; ++n) {
+            int col = tile * DEFAULT_BLOCK_N + n;
+            if (col < vc) {
+                int ltok = indices[row * (topk + 1) + col];
+                int lp = ltok / page_sz;
+                int po = ltok % page_sz;
+
+                if (ltok >= 0 && lp < max_pages) {
+                    int pb = btable[req * max_pages + lp];
+                    if (pb >= 0 && pb < nblocks) {
+                        size_t kv_offset = (size_t)pb * stride_blk + (size_t)po * stride_po + stride_kv + d0;
+
+                        // 32-bit coalesced load for 4 FP8 Key elements
+                        uint32_t k_u32 = *reinterpret_cast<const uint32_t*>(&k[kv_offset]);
+                        float kd0, kd1, kd2, kd3;
+                        fp8x4_to_float4(k_u32, kd0, kd1, kd2, kd3);
+
+                        // 32-bit coalesced load for 4 FP8 Value elements
+                        uint32_t v_u32 = *reinterpret_cast<const uint32_t*>(&v[kv_offset]);
+                        float vd0, vd1, vd2, vd3;
+                        fp8x4_to_float4(v_u32, vd0, vd1, vd2, vd3);
+
+                        // Dot product across 4 local dimensions
+                        float partial = qd0 * kd0 + qd1 * kd1 + qd2 * kd2 + qd3 * kd3;
+
+                        // Full 128-dim reduction across the 32 threads in the warp
+                        float score = warp_reduce_sum(partial) * softmax_scale;
+
+                        // Online softmax update (Milakov-Gimelshteyn)
+                        float new_mx = fmaxf(mx, score);
+                        float alpha = exp2f(mx - new_mx);
+                        float p = exp2f(score - new_mx);
+                        mx = new_mx;
+
+                        acc0 = acc0 * alpha + p * vd0;
+                        acc1 = acc1 * alpha + p * vd1;
+                        acc2 = acc2 * alpha + p * vd2;
+                        acc3 = acc3 * alpha + p * vd3;
+                        nm = nm * alpha + p;
+                    }
+                }
+            }
+        }
+    }
+
+    // Epilogue: Fold v_scale into post-normalization scalar
+    float safe_nm = fmaxf(nm, 1e-20f);
+    float inv_nm_vscale = v_scale / safe_nm;
+
+    float ctx0 = acc0 * inv_nm_vscale;
+    float ctx1 = acc1 * inv_nm_vscale;
+    float ctx2 = acc2 * inv_nm_vscale;
+    float ctx3 = acc3 * inv_nm_vscale;
+
+    // Load Gate vector using 64-bit load
+    uint64_t g_u64 = *reinterpret_cast<const uint64_t*>(&gate[q_offset]);
+    __nv_bfloat162 g_lo = *reinterpret_cast<const __nv_bfloat162*>(&g_u64);
+    __nv_bfloat162 g_hi = *(reinterpret_cast<const __nv_bfloat162*>(&g_u64) + 1);
+
+    const float log2e = 1.4426950408889634f;
+    float sig0 = __fdividef(1.0f, 1.0f + exp2f(-__bfloat162float(g_lo.x) * log2e));
+    float sig1 = __fdividef(1.0f, 1.0f + exp2f(-__bfloat162float(g_lo.y) * log2e));
+    float sig2 = __fdividef(1.0f, 1.0f + exp2f(-__bfloat162float(g_hi.x) * log2e));
+    float sig3 = __fdividef(1.0f, 1.0f + exp2f(-__bfloat162float(g_hi.y) * log2e));
+
+    // Vectorized 64-bit store committed to global memory
+    __nv_bfloat162 res_lo = __float22bfloat162_rn(make_float2(ctx0 * sig0, ctx1 * sig1));
+    __nv_bfloat162 res_hi = __float22bfloat162_rn(make_float2(ctx2 * sig2, ctx3 * sig3));
+
+    uint64_t res_u64;
+    *reinterpret_cast<__nv_bfloat162*>(&res_u64) = res_lo;
+    *(reinterpret_cast<__nv_bfloat162*>(&res_u64) + 1) = res_hi;
+    *reinterpret_cast<uint64_t*>(&out[q_offset]) = res_u64;
+}
+```
 
 ### Microarchitectural Optimizations in Raw CUDA C++:
 1. **Direct 32-Bit Vector Loads for 4x FP8 Elements**:

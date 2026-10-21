@@ -1,157 +1,53 @@
+# Sparse Paged GQA FP8 Kernels — SM89
 
-# QSA Sparse Paged GQA — SM89 CuTe DSL
+This repository contains synthetic sparse Grouped-Query Attention (GQA) benchmarks for NVIDIA Ada Lovelace GPUs (compute capability 8.9). It includes optimized and baseline CuTe DSL kernels, a raw CUDA C++ kernel, and a Mojo / MAX implementation.
 
-High-performance sparse FP8 Grouped-Query Attention kernel for NVIDIA Ada Lovelace (SM89).
+## Workload
 
-**Author**: Ammar Alnagar  
-**Target Hardware**: NVIDIA GeForce RTX 4060 Laptop GPU (sm_89, 8 GB VRAM)  
-**Software**: NVIDIA CuTe DSL (`nvidia-cutlass-dsl 4.8.1`), CUDA 13.4, PyTorch 2.x
+- 64 requests, 32 query heads, 8 KV heads, and head dimension 128
+- Top-K 512, page size 16, FP8 E4M3FN K/V cache
+- BF16 query, gate, and output tensors
+- Fused sigmoid gate and online softmax
 
----
+## Latest supplied results
 
-## Overview
+Measurements below are from the RTX 4060 Laptop run supplied on October 21, 2026. CuTe and CUDA kernel durations use CUDA events. Mojo uses host wall-clock timing around enqueue calls and a final synchronization, so it is not a pure GPU duration.
 
-This repository contains a complete end-to-end implementation of **Quick Sparse Attention (QSA)** with:
+| Implementation | Latency | Derived compute rate | Validation output |
+|---|---:|---:|---|
+| Baseline CuTe (`backup.py`) | 2.5078 ms | 0.214 TFLOP/s | PASS |
+| **Optimized CuTe (`sm89_cutedsl.py`)** | **0.7933 ms** | **0.677 TFLOP/s** | **PASS** |
+| Raw CUDA (`sm89_cuda.cu`) | 1.0042 ms | 0.535 TFLOP/s | PASS |
+| Mojo / MAX (`sm89_mojo.mojo`) | 2.5402 ms* | 0.211 TFLOP/s* | Prints PASS* |
 
-- Grouped-Query Attention (GQA)
-- Paged KV cache
-- Top-K sparsity
-- FP8-e4m3fn Key/Value cache
-- Online softmax (Milakov-Gimelshteyn algorithm)
-- Fused output gating
+The optimized CuTe result is about 3.16× faster than the baseline in this run. The saved Nsight Compute reports are older and record 3.41 ms for baseline CuTe, 1.12 ms for optimized CuTe, and 1.00 ms for CUDA; these are kept separate from the latest run. The Mojo source currently prints hard-coded error/pass values rather than calculating a reference comparison.
 
-The kernel is written entirely in **NVIDIA CuTe DSL** and is optimized specifically for Ada Lovelace (SM89).
+## Repository files
 
-### Key Result
+- `sm89_cutedsl.py` — optimized CuTe DSL kernel, one CTA per request/KV head
+- `backup.py` — baseline CuTe kernel, one CTA per request/query head
+- `sm89_cuda.cu` — CUDA C++ implementation
+- `sm89_mojo.mojo` — Mojo / MAX implementation
+- `qsa_sm89_*.ncu-rep` — saved Nsight Compute captures for baseline CuTe, optimized CuTe, and CUDA
+- [`wrtiteup.md`](wrtiteup.md) — implementation details, profiling notes, and measurement caveats
 
-| Kernel              | Latency (64 req × 512 top-k) | Speedup |
-|---------------------|------------------------------|---------|
-| Baseline            | 3.41 ms                      | 1.00×   |
-| **Optimized (this)**| **1.12 ms**                  | **3.04×** |
-
----
-
-## Repository Structure
-
-```text
-.
-├── sm89_cutedsl.py              # Optimized production kernel (GQA warp tiling)
-├── backup.py                    # Baseline kernel (1 CTA per query head)
-├── qsa_sm89_cutedsl.ncu-rep     # Nsight Compute report – optimized
-├── qsa_sm89_baseline.ncu-rep    # Nsight Compute report – baseline
-└── README.md
-```
-
----
-
-## Quick Start
-
-### Requirements
-
-```bash
-pip install torch nvidia-cutlass-dsl
-```
-
-CUDA 12.4+ / 13.x and an SM89 GPU (RTX 40-series) are required.
-
-### Run the Optimized Kernel
+## Run
 
 ```bash
 python3 sm89_cutedsl.py
+python3 backup.py
+cudarun sm89_cuda.cu
+mojo sm89_mojo.mojo
 ```
 
-Expected output (on RTX 4060 Laptop):
-
-```text
-GPU   : NVIDIA GeForce RTX 4060 Laptop GPU
-SM    : sm_89
-[reference] running ...
-[CuTe DSL] compiling + warmup ...
-  max abs err : ~0.00000x
-  PASS        : True
-  Latency     : ~1.12 ms/iter
-  Throughput  : ~0.48 TFLOP/s
-```
-
-### Run the Baseline (for comparison)
+The CUDA command above uses the local `cudarun` helper. To compile directly with NVCC, use:
 
 ```bash
-python3 backup.py
+nvcc -O3 -arch=sm_89 -lineinfo sm89_cuda.cu -o sm89_cuda
+./sm89_cuda
 ```
 
----
+## Kernel organization
 
-## Architecture Highlights
-
-### Optimized Design (`sm89_cutedsl.py`)
-
-- **1 CTA per (request, KV head)** → 4 warps cooperate on the same GQA group
-- **Warp-level butterfly shuffle** for the full 128-dim QK reduction (no shared memory)
-- **0 `sync_threads()`** barriers in the token loop
-- **128-byte coalesced FP8 loads**
-- **Scale folding**: `k_scale` into softmax scale, `v_scale` into post-loop normalizer
-- Pre-compiled with `cute.compile` to eliminate Python JIT overhead
-
-### Baseline Design (`backup.py`)
-
-- 1 CTA per query head
-- Shared-memory cross-warp reduction tree
-- 2 barriers per token
-- Used only for performance comparison
-
----
-
-## Performance Summary (Nsight Compute)
-
-| Metric                      | Baseline     | Optimized    | Improvement      |
-|-----------------------------|--------------|--------------|------------------|
-| Kernel Duration             | 3.41 ms      | **1.12 ms**  | **3.04×**        |
-| Compute Throughput          | 0.16 TFLOP/s | **0.48 TFLOP/s** | **3.05×**    |
-| DRAM Bandwidth              | 20.5 GB/s    | **62.1 GB/s**| **3.03×**        |
-| L1 Cache Hit Rate           | 49.8 %       | **93.9 %**   | +44.1 pp         |
-| Block Barriers per CTA      | 1 024        | **0**        | 100 % eliminated |
-| Dynamic Shared Memory       | 16 B         | **0 B**      | Full L1 capacity |
-
----
-
-## Mathematical Core
-
-The kernel implements gated sparse attention:
-
-```
-Output = (Σ pᵢ · (Vᵢ × v_scale)) ⊙ σ(Gate)
-```
-
-with online softmax:
-
-```
-m_new = max(m, s)
-α     = 2^(m - m_new)
-p     = 2^(s - m_new)
-acc   = acc × α + p · V
-ℓ     = ℓ   × α + p
-```
-
-All scales are folded so that the inner token loop contains only FMAs and `ex2.approx.f32`.
-
----
-
-## Engineering Notes
-
-Six major issues were solved during development:
-
-1. MLIR SSA region leak (Constexpr annotations must match between `@cute.jit` and `@cute.kernel`)
-2. Independent Thread Scheduling deadlock on `__shfl_sync`
-3. Silent FP8 type trap (`Float8E4M3` vs `Float8E4M3FN`)
-4. 39 ms Python JIT overhead → fixed with `cute.compile`
-5. `UNSUP_EARLY_EXIT` → replaced by structured predicates
-6. VRAM explosion on 8 GB laptop → direct FP8 allocation
-
-Full technical write-up is available in the accompanying engineering document.
-
----
-
-## License
-
-This code is provided for research and educational purposes.
+The optimized CuTe and CUDA versions launch one 128-thread CTA per `(request, KV head)`. Its four warps each handle one query head in that GQA group, and each warp reduces a 128-dimensional dot product with five butterfly shuffles. The baseline instead launches one CTA per query head and uses shared-memory cross-warp reduction. The Mojo version uses the grouped launch mapping but has its own host-timed benchmark path.
 

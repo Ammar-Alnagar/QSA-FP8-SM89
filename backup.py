@@ -1,11 +1,13 @@
 """
 QSA Sparse Paged GQA — SM89 port using CuTe DSL (nvidia-cutlass-dsl 4.8.1)
+Baseline kernel (1 CTA per query head, cross-warp SMEM reduction)
 RTX 4060 Laptop GPU  |  compute_capability = 8.9  |  FP8-e4m3fn K/V cache
 
-Run:  .venv/bin/python sm89_cutedsl.py
+Run:  .venv/bin/python backup.py
 """
 
 import math
+import sys
 
 import cutlass
 import cutlass.cute as cute
@@ -13,17 +15,18 @@ import torch
 from cutlass.utils import create_cute_tensor_for_fp8
 
 # ── config ──────────────────────────────────────────────────────────────────
-NUM_REQUESTS = 32
+NUM_REQUESTS = 64
 NUM_Q_HEADS = 32
 NUM_KV_HEADS = 8
 GROUP_SIZE = NUM_Q_HEADS // NUM_KV_HEADS  # 4
 HEAD_DIM = 128
 PAGE_SIZE = 16
-MAX_PAGES = 256
-TOPK = 256
+MAX_PAGES = 512
+TOPK = 512
+BLOCK_N = 32
 
-WARMUP = 10
-BENCH = 100
+WARMUP = 5 if "--profile" in sys.argv else 10
+BENCH = 1 if "--profile" in sys.argv else 50
 
 
 # ── synthetic tensors ────────────────────────────────────────────────────────
@@ -33,12 +36,20 @@ def make_tensors(device="cuda"):
     rows = NUM_REQUESTS
 
     q = torch.randn(rows, NUM_Q_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=device)
-    kf = torch.randn(nblocks, PAGE_SIZE, NUM_KV_HEADS, HEAD_DIM, device=device) * 0.1
-    k_fp8 = kf.to(torch.float8_e4m3fn)
-    del kf
-    vf = torch.randn(nblocks, PAGE_SIZE, NUM_KV_HEADS, HEAD_DIM, device=device) * 0.1
-    v_fp8 = vf.to(torch.float8_e4m3fn)
-    del vf
+    k_fp8 = (
+        torch.randn(
+            nblocks, PAGE_SIZE, NUM_KV_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=device
+        )
+        * 0.1
+    ).to(torch.float8_e4m3fn)
+    torch.cuda.empty_cache()
+
+    v_fp8 = (
+        torch.randn(
+            nblocks, PAGE_SIZE, NUM_KV_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=device
+        )
+        * 0.1
+    ).to(torch.float8_e4m3fn)
     torch.cuda.empty_cache()
 
     btable = torch.arange(nblocks, dtype=torch.int32, device=device).view(
@@ -63,8 +74,6 @@ def reference(q, k_fp8, v_fp8, k_scale, v_scale, btable, t2r, indices, gate):
     gs = nqh // nkv
     topk = indices.shape[1] - 1
     scale = hd**-0.5
-    kf = k_fp8.to(torch.float32) * k_scale
-    vf = v_fp8.to(torch.float32) * v_scale
     out = torch.zeros(rows, nqh, hd, dtype=torch.float32, device=q.device)
     for r in range(rows):
         req = int(t2r[r])
@@ -84,8 +93,8 @@ def reference(q, k_fp8, v_fp8, k_scale, v_scale, btable, t2r, indices, gate):
         if pb.numel() == 0:
             continue
         for g in range(nkv):
-            keys = kf[pb, po, g, :]  # [N, hd]
-            vals = vf[pb, po, g, :]
+            keys = k_fp8[pb, po, g, :].to(torch.float32) * k_scale  # [N, hd]
+            vals = v_fp8[pb, po, g, :].to(torch.float32) * v_scale
             h0 = g * gs
             qg = q[r, h0 : h0 + gs, :].float()
             sc = qg @ keys.T * scale
@@ -147,7 +156,6 @@ def qsa_sm89_kernel(
         for tile in range(ntiles):
             for n in range(BLOCK_N):
                 col = tile * BLOCK_N + n
-                # guard: col >= vc  (replaces break — runs remaining iters as no-ops)
                 if col < vc:
                     ltok = idx[row, col]
                     lp = ltok // PAGE_SZ
@@ -263,6 +271,23 @@ def launch_qsa(
 
 
 # ── driver ───────────────────────────────────────────────────────────────────
+_COMPILED_LAUNCH = None
+
+
+def get_compiled_kernel(
+    q, k_cute, v_cute, indices, btable, t2r, gate, out, ss_log2, v_scale, nblocks, nreqs, rows, nqh
+):
+    global _COMPILED_LAUNCH
+    if _COMPILED_LAUNCH is None:
+        args = [
+            q, k_cute, v_cute, indices, btable, t2r, gate, out,
+            ss_log2, v_scale, nblocks, nreqs, rows, nqh,
+            TOPK, PAGE_SIZE, MAX_PAGES, HEAD_DIM, BLOCK_N, GROUP_SIZE,
+        ]
+        _COMPILED_LAUNCH = cute.compile(launch_qsa, *args)
+    return _COMPILED_LAUNCH
+
+
 def run(q, k_fp8, v_fp8, k_scale, v_scale, btable, t2r, indices, gate):
     rows = q.shape[0]
     nqh = q.shape[1]
@@ -291,27 +316,15 @@ def run(q, k_fp8, v_fp8, k_scale, v_scale, btable, t2r, indices, gate):
         source_f32_tensor=v_fp8_c.to(torch.float32),
     )
 
-    launch_qsa(
-        q.contiguous(),
-        k_cute,
-        v_cute,
-        indices.contiguous(),
-        btable.contiguous(),
-        t2r.contiguous(),
-        gate.contiguous(),
-        out,
-        ss_log2,
-        float(v_scale),
-        nblocks,
-        nreqs,
-        rows,
-        nqh,
-        topk,
-        pg_sz,
-        max_pg,
-        hd,
-        32,
-        GROUP_SIZE,
+    compiled_fn = get_compiled_kernel(
+        q.contiguous(), k_cute, v_cute, indices.contiguous(), btable.contiguous(),
+        t2r.contiguous(), gate.contiguous(), out,
+        ss_log2, float(v_scale), nblocks, nreqs, rows, nqh,
+    )
+    compiled_fn(
+        q.contiguous(), k_cute, v_cute, indices.contiguous(), btable.contiguous(),
+        t2r.contiguous(), gate.contiguous(), out,
+        ss_log2, float(v_scale), nblocks, nreqs, rows, nqh,
     )
     torch.cuda.synchronize()
     return out
@@ -335,7 +348,7 @@ def main():
     ref = reference(*tensors)
     print(f"  shape={tuple(ref.shape)}, dtype={ref.dtype}")
 
-    print("\n[CuTe DSL] compiling + warmup ...")
+    print("\n[CuTe DSL baseline] compiling + warmup ...")
     m0_alloc, m0_res = vram()
     out = run(*tensors)
     m1_alloc, m1_res = vram()
@@ -383,38 +396,26 @@ def main():
     gate_c = gate.contiguous()
     v_sc_f = float(v_scale)
 
+    compiled_fn = get_compiled_kernel(
+        q_c, k_cute, v_cute, idx_c, bt_c, t2r_c, gate_c, out,
+        ss_log2, v_sc_f, nblocks, nreqs, rows, nqh,
+    )
+    runtime_args = [
+        q_c, k_cute, v_cute, idx_c, bt_c, t2r_c, gate_c, out,
+        ss_log2, v_sc_f, nblocks, nreqs, rows, nqh,
+    ]
+
     # benchmark pure kernel
     t0 = torch.cuda.Event(enable_timing=True)
     t1 = torch.cuda.Event(enable_timing=True)
     t0.record()
     for _ in range(BENCH):
-        launch_qsa(
-            q_c,
-            k_cute,
-            v_cute,
-            idx_c,
-            bt_c,
-            t2r_c,
-            gate_c,
-            out,
-            ss_log2,
-            v_sc_f,
-            nblocks,
-            nreqs,
-            rows,
-            nqh,
-            topk,
-            pg_sz,
-            max_pg,
-            hd,
-            32,
-            GROUP_SIZE,
-        )
+        compiled_fn(*runtime_args)
     t1.record()
     torch.cuda.synchronize()
     kernel_ms = t0.elapsed_time(t1) / BENCH
 
-    # benchmark end-to-end driver (including create_cute_tensor_for_fp8)
+    # benchmark end-to-end driver
     t0.record()
     for _ in range(min(BENCH, 10)):
         run(*tensors)
@@ -430,7 +431,7 @@ def main():
     print(f"  E2E Latency   : {e2e_ms:.3f} ms/iter")
     print(f"  Throughput    : {tflops:.3f} TFLOP/s (compute)")
     print(f"\n{'=' * 55}")
-    print(f"  SUMMARY  CuTe DSL sparse GQA FP8 (32 reqs, TopK=256)")
+    print(f"  SUMMARY  CuTe DSL baseline GQA FP8 ({rows} reqs, TopK={nv})")
     print(
         f"  Kernel: {kernel_ms * 1000:.1f} us  |  {tflops:.2f} TFLOP/s  |  PASS={diff.max() < 0.12}"
     )

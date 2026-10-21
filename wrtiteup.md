@@ -54,7 +54,7 @@ This document breaks down the mathematics of the attention kernel, the step-by-s
 ### 2.1 The Attention Equation with Gating & FP8 Scaling
 The kernel computes gated sparse attention:
 
-$$\text{Output}_{r, h, :} = \left[ \sum_{i=0}^{K-1} P_{r, h, i} \cdot \left( V_{\text{phys}(r, i), g, :} \times v\_\text{scale} \right) \right] \odot \sigma(\text{Gate}_{r, h, :})$$
+$$\text{Output}_{r, h, :} = \left[ \sum_{i=0}^{K-1} P_{r, h, i} \cdot \left( V_{\text{phys}(r, i), g, :} \times v_{\text{scale}} \right) \right] \odot \sigma(\text{Gate}_{r, h, :})$$
 
 Where:
 * $r \in [0, B-1]$ is the request index.
@@ -67,7 +67,7 @@ Where:
 * $P_{r, h, i}$ is the online softmax probability weight:
   $$P_{r, h, i} = \frac{\exp\left(S_{r, h, i} - m_{\text{final}}\right)}{\sum_{j} \exp\left(S_{r, h, j} - m_{\text{final}}\right)}$$
 * $S_{r, h, i}$ is the scaled dot product:
-  $$S_{r, h, i} = \left( Q_{r, h, :} \cdot \left( K_{\text{phys}(r, i), g, :} \times k\_\text{scale} \right) \right) \times \frac{1}{\sqrt{D}}$$
+  $$S_{r, h, i} = \left( Q_{r, h, :} \cdot \left( K_{\text{phys}(r, i), g, :} \times k_{\text{scale}} \right) \right) \times \frac{1}{\sqrt{D}}$$
 * $\sigma(\text{Gate})$ is the fused element-wise sigmoid activation:
   $$\sigma(x) = \frac{1}{1 + e^{-x}} = \frac{1}{1 + 2^{-x \cdot \log_2(e)}}$$
 
@@ -95,17 +95,17 @@ $$\text{Context Vector} = \frac{\text{acc}_{\text{final}}}{\max(\ell_{\text{fina
 
 ### 2.3 Mathematical Optimization: Scale Folding
 In standard attention, Key and Value vectors must be dequantized from FP8 to float32:
-$$K_{\text{float}} = K_{\text{fp8}} \times k\_\text{scale}, \quad V_{\text{float}} = V_{\text{fp8}} \times v\_\text{scale}$$
+$$K_{\text{float}} = K_{\text{fp8}} \times k_{\text{scale}}, \quad V_{\text{float}} = V_{\text{fp8}} \times v_{\text{scale}}$$
 
-Rather than performing multiplications by $k\_\text{scale}$ and $v\_\text{scale}$ inside the hot inner token loop:
-1. **$k\_\text{scale}$ is folded into `softmax_scale`**:
-   $$\text{softmax\_scale} = \left(\frac{1}{\sqrt{D}} \times k\_\text{scale}\right) \times \log_2(e)$$
+Rather than performing multiplications by $k_{\text{scale}}$ and $v_{\text{scale}}$ inside the hot inner token loop:
+1. **$k_{\text{scale}}$ is folded into `softmax_scale`**:
+   $$\text{softmax\_scale} = \left(\frac{1}{\sqrt{D}} \times k_{\text{scale}}\right) \times \log_2(e)$$
    By incorporating $\log_2(e) \approx 1.44269504$, the dot product directly yields powers of 2, allowing the GPU's Special Function Unit (SFU) to evaluate $2^x$ in a single hardware cycle via the `ex2.approx.f32` instruction.
-2. **$v\_\text{scale}$ is folded into the post-loop normalizer**:
+2. **$v_{\text{scale}}$ is folded into the post-loop normalizer**:
    Because Value accumulation is linear:
-   $$\sum_i p_i (V_i \times v\_\text{scale}) = v\_\text{scale} \times \left(\sum_i p_i V_i\right)$$
-   We accumulate raw unscaled $V_i$ values inside the loop, and multiply by $v\_\text{scale}$ **only once** during final output normalization:
-   $$\text{inv\_norm} = \frac{v\_\text{scale}}{\max(\ell_{\text{final}}, 10^{-20})}$$
+   $$\sum_i p_i (V_i \times v_{\text{scale}}) = v_{\text{scale}} \times \left(\sum_i p_i V_i\right)$$
+   We accumulate raw unscaled $V_i$ values inside the loop, and multiply by $v_{\text{scale}}$ **only once** during final output normalization:
+   $$\text{inv\_norm} = \frac{v_{\text{scale}}}{\max(\ell_{\text{final}}, 10^{-20})}$$
    $$\text{Context}_d = \text{acc}_d \times \text{inv\_norm}$$
    This eliminates 512 floating-point multiplications per lane.
 
@@ -439,7 +439,7 @@ out[row, head, d1] = cutlass.BFloat16(ctx1 * sig1)
 out[row, head, d2] = cutlass.BFloat16(ctx2 * sig2)
 out[row, head, d3] = cutlass.BFloat16(ctx3 * sig3)
 ```
-* Value scale $v\_\text{scale}$ is folded directly into `inv_nm_vscale = v_scale / safe_nm`.
+* Value scale $v_{\text{scale}}$ is folded directly into `inv_nm_vscale = v_scale / safe_nm`.
 * Sigmoid activation $\sigma(g) = \frac{1}{1 + 2^{-g \log_2(e)}}$ executes via SFU base-2 exponentiation.
 * The result converts to `bfloat16` via `f2fp.bf16.f32.pack_ab` and stores to global memory.
 
@@ -988,9 +988,9 @@ In Grouped-Query Attention, 4 query heads share the identical Key and Value cach
   This matches the exact size of a DRAM burst transaction and covers four 32-byte L1 cache sectors, tripling memory throughput to **62.11–69.43 GB/s** (24.28%–27.15% of DRAM Speed of Light).
 
 ### 4. Value Scale Arithmetic Hoisting
-* **In the Baseline Kernel**: Multiplied every Value element by $v\_\text{scale}$ inside the token loop (512 multiplications per coordinate).
-* **In the Optimized Kernels**: Values accumulate unscaled in registers; the scalar factor $v\_\text{scale}$ is multiplied once after all 512 tokens finish:
-  $$\text{inv\_scale} = \frac{v\_\text{scale}}{\max(\ell_{\text{final}}, 10^{-20})}$$
+* **In the Baseline Kernel**: Multiplied every Value element by $v_{\text{scale}}$ inside the token loop (512 multiplications per coordinate).
+* **In the Optimized Kernels**: Values accumulate unscaled in registers; the scalar factor $v_{\text{scale}}$ is multiplied once after all 512 tokens finish:
+  $$\text{inv\_scale} = \frac{v_{\text{scale}}}{\max(\ell_{\text{final}}, 10^{-20})}$$
   This hoists 512 floating-point multiplications out of the inner loop per lane, reducing ALU workload.
 
 ### 5. Zero Shared Memory Allocation (100% SRAM for L1 Cache)

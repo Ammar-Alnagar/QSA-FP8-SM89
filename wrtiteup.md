@@ -469,7 +469,218 @@ To push Ada Lovelace SM89 to its absolute physical performance ceiling, we also 
 
 ---
 
-## 7. Disassembly Analysis: Emitted PTX and SASS
+## 7. Raw CUDA C++ Kernel: Line-by-Line Anatomy
+
+The raw CUDA C++ kernel in [`sm89_cuda.cu`](file:///home/ammar/work/QSA-P8-SM89/sm89_cuda.cu) mirrors the logical structure of the CuTe DSL kernel but exposes every hardware interaction explicitly. Let us walk through it section by section.
+
+### Section A: Hardware FP8 Dequantization — `fp8x4_to_float4`
+
+```cuda
+__device__ __forceinline__ void fp8x4_to_float4(
+    uint32_t u32_val,
+    float& f0, float& f1, float& f2, float& f3
+) {
+    uint16_t lo = static_cast<uint16_t>(u32_val & 0xFFFF);
+    uint16_t hi = static_cast<uint16_t>(u32_val >> 16);
+
+    uint32_t h2_lo, h2_hi;
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h2_lo) : "h"(lo));
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h2_hi) : "h"(hi));
+
+    float2 fl = __half22float2(*reinterpret_cast<const __half2*>(&h2_lo));
+    float2 fh = __half22float2(*reinterpret_cast<const __half2*>(&h2_hi));
+    f0 = fl.x; f1 = fl.y; f2 = fh.x; f3 = fh.y;
+}
+```
+
+This function is the critical optimization that the CuTe DSL MLIR compiler cannot replicate at the PTX level. In a single helper call:
+
+1. The 32-bit register `u32_val` holding 4 packed FP8 bytes is **split into two 16-bit halves**. Each 16-bit half holds exactly the bit-layout that the SM89 `cvt.rn.f16x2.e4m3x2` converter expects — two `fp8_e4m3fn` bytes packed side by side.
+2. Two **inline PTX `asm`** statements emit the native Ada Lovelace SM89 hardware converter instruction directly. `cvt.rn.f16x2.e4m3x2` converts two FP8-e4m3fn values to two FP16 values in **a single clock cycle** using the dedicated converter pipeline. No intermediate integer shifts, no multiplication, no bias correction in ALU code.
+3. The two resulting `half2` registers are widened to `float2` using `__half22float2`, which on SM89 emits `cvt.f32.f16` — a zero-overhead promotion instruction.
+
+**Contrast with CuTe DSL**: In the optimized CuTe DSL kernel, `cutlass.Float32(k[pb, po, kv_head, d])` triggers the MLIR lowering to emit `cvt.rn.f32.e4m3x2` through the CUTLASS MLIR backend. This path works correctly but fuses less aggressively; the MLIR pass first converts FP8 to FP32 individually without the intermediate FP16 packing optimization. The inline PTX `asm` path in raw CUDA is shorter — two `cvt.rn.f16x2.e4m3x2` plus two `cvt.f32.f16` — than the MLIR-emitted path in some lowering configurations. This is not a correctness issue; both produce bit-identical results. The difference shows up as fewer total converter clock cycles per token.
+
+---
+
+### Section B: Warp Butterfly Reduction — `warp_reduce_sum`
+
+```cuda
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
+    }
+    return val;
+}
+```
+
+This is semantically identical to the CuTe DSL `shuffle_sync_bfly` reduction. However, the C++ template inliner and NVCC's `#pragma unroll` directive guarantee that the compiler:
+
+1. **Completely unrolls** the 5 iterations at compile time (the MLIR loop might keep it symbolic for longer).
+2. **Hoists the loop bounds** from a register into immediate constants in the PTX, enabling the assembler (PTXAS) to perform more aggressive scheduling of the 5 shuffle + add instruction pairs.
+3. Uses `__shfl_xor_sync` (XOR mask) instead of `__shfl_bfly_sync`, which on Ada Lovelace is a numerically identical but slightly different hardware path — both consume one clock in the warp datapath.
+
+The key advantage: because this is a C++ `__forceinline__` function, NVCC **inlines the entire butterfly into the call site**, merging register allocation with the surrounding code. The MLIR abstraction inserts a function boundary at the JIT boundary that may prevent cross-function register coalescing (contributing to 38 registers instead of 34).
+
+---
+
+### Section C: Thread Coordinates, Query Load — Vectorized 64-Bit IO
+
+```cuda
+int row = blockIdx.x;
+int kv_head = blockIdx.y;
+int tid = threadIdx.x;
+
+int warp_id = tid / 32;
+int lane_id = tid % 32;
+int q_head = kv_head * group_sz + warp_id;
+
+int req = t2r[row];
+if (req < 0 || req >= nreqs) return;  // Early-exit: safe in native C++!
+
+// Each lane handles 4 contiguous coordinates
+int d0 = lane_id * 4;
+size_t q_offset = (size_t)row * (num_q_heads * head_dim) + (size_t)q_head * head_dim + d0;
+
+// Vectorized 64-bit load (4 x bfloat16 = 8 bytes in one LDG.64)
+uint64_t q_u64 = *reinterpret_cast<const uint64_t*>(&q[q_offset]);
+__nv_bfloat162 q_lo = *reinterpret_cast<const __nv_bfloat162*>(&q_u64);
+__nv_bfloat162 q_hi = *(reinterpret_cast<const __nv_bfloat162*>(&q_u64) + 1);
+
+float qd0 = __bfloat162float(q_lo.x);
+float qd1 = __bfloat162float(q_lo.y);
+float qd2 = __bfloat162float(q_hi.x);
+float qd3 = __bfloat162float(q_hi.y);
+```
+
+Three differences vs the CuTe DSL version are visible here:
+
+1. **Structured early exit is legal**: In raw CUDA C++, `if (req < 0 || req >= nreqs) return;` compiles to a predicated branch and early kernel exit — zero cost for the common case. The CuTe DSL compiler rejected this with `UNSUP_EARLY_EXIT`, forcing extra predicated branches around the entire inner loop body (Battle 5).
+
+2. **Vectorized 64-bit load for Query**: The raw CUDA code loads all 4 BF16 query coordinates in a single `LDG.E.64` instruction. This is a `uint64_t` load — the GPU memory pipeline handles 8 bytes in a single issue slot. By contrast, the CuTe DSL kernel may issue `LDG.E` (32-bit) loads for each pair of BF16 values, taking two instruction slots. From NCU: the raw CUDA kernel's L1 load instruction count is measurably lower per warp.
+
+3. **Explicit `size_t` pointer arithmetic**: `(size_t)row * (num_q_heads * head_dim)` casts to 64-bit address arithmetic at the source level. The compiler is not required to infer pointer aliasing or integer promotion rules from MLIR intrinsics; the NVCC PTX output directly emits the correct 64-bit addressing modes for global memory (`.s64` operands on `ld.global`).
+
+---
+
+### Section D: Token Loop with `#pragma unroll 4`
+
+```cuda
+int ntiles = (vc + DEFAULT_BLOCK_N - 1) / DEFAULT_BLOCK_N;
+for (int tile = 0; tile < ntiles; ++tile) {
+    #pragma unroll 4
+    for (int n = 0; n < DEFAULT_BLOCK_N; ++n) {
+        int col = tile * DEFAULT_BLOCK_N + n;
+        if (col < vc) {
+            int ltok = indices[row * (topk + 1) + col];
+            int lp = ltok / page_sz;
+            int po = ltok % page_sz;
+            ...
+        }
+    }
+}
+```
+
+The `#pragma unroll 4` directive on the `BLOCK_N = 32` inner loop instructs PTXAS to unroll 4 iterations simultaneously. The hardware effects are:
+
+- **Instruction-Level Parallelism (ILP)**: With 4 iterations unrolled, the compiler can overlap the `LDG` (global memory load) from iteration `n+1` with the arithmetic (`FMA`, `MUFU.EX2`) from iteration `n`. The Ada Lovelace SM89 has out-of-order issue within an SM's warp scheduler — **load latency (200–240 cycles for an L2 miss) can be hidden by reordering arithmetic from adjacent unrolled iterations**. The CuTe DSL `range_constexpr` loop does emit a compile-time-fixed loop, but the MLIR lowering does not insert explicit `#pragma unroll` semantics; the resulting PTX may have fewer prefetch opportunities.
+- **Register Reuse**: With 4 copies of the loop body merged, the register allocator can assign different FP8 pack registers (`k_u32`, `v_u32`) to separate hardware registers and interleave their load/use distances, reducing scoreboard stall cycles.
+- **Computed from NCU**: The raw CUDA kernel achieves **2.88 active IPC** versus **2.80 IPC** for the optimized CuTe DSL kernel. This 2.9% IPC improvement is entirely attributable to the tighter instruction scheduling enabled by `#pragma unroll 4` and the NVCC global instruction scheduler.
+
+---
+
+### Section E: Coalesced 32-Bit FP8 Loads — K and V
+
+```cuda
+size_t kv_offset = (size_t)pb * stride_blk + (size_t)po * stride_po + stride_kv + d0;
+
+// 32-bit load covers 4 FP8 bytes — 128 contiguous bytes across the 32-lane warp
+uint32_t k_u32 = *reinterpret_cast<const uint32_t*>(&k[kv_offset]);
+float kd0, kd1, kd2, kd3;
+fp8x4_to_float4(k_u32, kd0, kd1, kd2, kd3);
+```
+
+Each thread issues a `LDG.E` (32-bit load, 4 bytes). Across the 32 lanes of the warp:
+$$32 \text{ threads} \times 4 \text{ bytes} = \mathbf{128 \text{ contiguous bytes}}$$
+
+This maps exactly to a 4-sector, 128-byte coalesced L1 / DRAM transaction. Because the stride between `d0` for adjacent lanes is exactly 4 bytes (the size of the `uint32_t` load), the compiler emits a single warp-level coalesced load instruction `LDG.E.128`, which the L1 cache serves in a single beat.
+
+Across the 4 warps in the block (GQA groups 0–3), the address `kv_offset` is **identical** because all warps share the same `(pb, po, kv_head)`. The KV cache line loaded by Warp 0 hits the SM's L1 cache (128 KB, exclusively for L1 due to zero shared memory allocation), so Warps 1, 2, and 3 pay only the **~10-cycle L1 hit latency** instead of 200+ cycles for DRAM. NCU confirms: **DRAM read sectors = 4,887,120** (barely different from the CuTe DSL version's 4,891,244), meaning both kernels achieve equivalent coalescing quality — the raw CUDA version simply issues fewer total load instructions due to explicit vectorization.
+
+The identical pattern applies to the Value cache:
+```cuda
+uint32_t v_u32 = *reinterpret_cast<const uint32_t*>(&v[kv_offset]);
+float vd0, vd1, vd2, vd3;
+fp8x4_to_float4(v_u32, vd0, vd1, vd2, vd3);
+```
+
+---
+
+### Section F: Online Softmax Accumulation — Same Math, Leaner Code
+
+```cuda
+float partial = qd0 * kd0 + qd1 * kd1 + qd2 * kd2 + qd3 * kd3;
+float score = warp_reduce_sum(partial) * softmax_scale;
+
+float new_mx = fmaxf(mx, score);
+float alpha = exp2f(mx - new_mx);
+float p = exp2f(score - new_mx);
+mx = new_mx;
+
+acc0 = acc0 * alpha + p * vd0;
+acc1 = acc1 * alpha + p * vd1;
+acc2 = acc2 * alpha + p * vd2;
+acc3 = acc3 * alpha + p * vd3;
+nm = nm * alpha + p;
+```
+
+`exp2f` on SM89 compiles to `MUFU.EX2` — exactly the same instruction as `cute.math.exp2` in the CuTe DSL version. `fmaxf` compiles to `FMNMX` or a `MAX` instruction. These are numerically and architecturally identical between the two kernels.
+
+The difference is register pressure. The NVCC register allocator, seeing the flat C++ scope, can:
+- Reuse the `partial` register after `warp_reduce_sum` returns (the result replaces the input).
+- Collapse `alpha` and `p` into the same register slots as temporaries from the prior iteration (possible because the outer loop is `#pragma unroll 4`'d).
+- The combined effect: **34 registers total** vs 38 for CuTe DSL. With 128 threads per block × 34 registers = 4,352 registers/block. The SM89 register file holds **65,536 registers per SM**. At 34 registers/thread, each SM can schedule **$\lfloor 65536 / 4352 \rfloor = 15$** blocks, vs **$\lfloor 65536 / 4864 \rfloor = 13$** blocks at 38 registers. More concurrent warps per SM means better latency hiding for L2/DRAM misses.
+
+---
+
+### Section G: Epilogue — Vectorized Gate Load and 64-Bit Store
+
+```cuda
+// Gate: vectorized 64-bit load
+uint64_t g_u64 = *reinterpret_cast<const uint64_t*>(&gate[q_offset]);
+__nv_bfloat162 g_lo = *reinterpret_cast<const __nv_bfloat162*>(&g_u64);
+__nv_bfloat162 g_hi = *(reinterpret_cast<const __nv_bfloat162*>(&g_u64) + 1);
+
+const float log2e = 1.4426950408889634f;
+float sig0 = __fdividef(1.0f, 1.0f + exp2f(-__bfloat162float(g_lo.x) * log2e));
+float sig1 = __fdividef(1.0f, 1.0f + exp2f(-__bfloat162float(g_lo.y) * log2e));
+float sig2 = __fdividef(1.0f, 1.0f + exp2f(-__bfloat162float(g_hi.x) * log2e));
+float sig3 = __fdividef(1.0f, 1.0f + exp2f(-__bfloat162float(g_hi.y) * log2e));
+
+// Pack into bfloat162 pairs and write with a single 64-bit store
+__nv_bfloat162 res_lo = __float22bfloat162_rn(make_float2(ctx0 * sig0, ctx1 * sig1));
+__nv_bfloat162 res_hi = __float22bfloat162_rn(make_float2(ctx2 * sig2, ctx3 * sig3));
+
+uint64_t res_u64;
+*reinterpret_cast<__nv_bfloat162*>(&res_u64) = res_lo;
+*(reinterpret_cast<__nv_bfloat162*>(&res_u64) + 1) = res_hi;
+*reinterpret_cast<uint64_t*>(&out[q_offset]) = res_u64;
+```
+
+The epilogue illustrates the most aggressive vectorization in the kernel:
+
+1. **Gate is loaded via `LDG.E.64`**: One 64-bit load for 4 BF16 values, compared to the CuTe DSL's four separate `cutlass.Float32(gate[...])` scalar dereferences (each a 16-bit `LDG.E` instruction, or at best two 32-bit loads). This halves the Gate IO instruction count.
+
+2. **`__float22bfloat162_rn`** packs two float32 values into a 32-bit `bfloat162` register using the dedicated BF16 rounding path. The two `bfloat162` results are then merged into a `uint64_t` via pointer-aliasing union tricks.
+
+3. **Output stored via `STG.E.64`**: One 64-bit store commits 4 BF16 output values in a single instruction. The CuTe DSL epilogue converts and stores each of the four output coordinates with `cutlass.BFloat16(...)` assignments — four `STG.E` (16-bit) or two `STG.E` (32-bit) stores. The 64-bit path requires half the store instruction budget.
+
+Total epilogue instruction savings vs CuTe DSL: 4 load instructions → 1 load (Gate), 4 store instructions → 1 store (Output). Across 512 thread blocks × 4 warps, these micro-savings compound into measurable IPC gains.
+
+---
+
+## 8. Disassembly Analysis: Emitted PTX and SASS
 
 Examining the low-level machine instructions emitted by the compiler reveals the architectural differences:
 

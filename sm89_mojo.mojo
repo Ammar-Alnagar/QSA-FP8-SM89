@@ -26,14 +26,14 @@ comptime LOG2E: Float32 = 1.4426950408889634
 # Device kernel
 # ---------------------------------------------------------------------------
 def qsa_sm89_kernel(
-    q_ptr:    Pointer[BFloat16, ...],
-    gate_ptr: Pointer[BFloat16, ...],
-    out_ptr:  Pointer[BFloat16, ...],
-    k_ptr:    Pointer[Float8_e4m3fn, ...],
-    v_ptr:    Pointer[Float8_e4m3fn, ...],
-    idx_ptr:  Pointer[Int32, ...],
-    bt_ptr:   Pointer[Int32, ...],
-    t2r_ptr:  Pointer[Int32, ...],
+    q_ptr:    Pointer[BFloat16, ImmutAnyOrigin],
+    gate_ptr: Pointer[BFloat16, ImmutAnyOrigin],
+    out_ptr:  Pointer[BFloat16, MutAnyOrigin],
+    k_ptr:    Pointer[Float8_e4m3fn, ImmutAnyOrigin],
+    v_ptr:    Pointer[Float8_e4m3fn, ImmutAnyOrigin],
+    idx_ptr:  Pointer[Int32, ImmutAnyOrigin],
+    bt_ptr:   Pointer[Int32, ImmutAnyOrigin],
+    t2r_ptr:  Pointer[Int32, ImmutAnyOrigin],
     softmax_scale: Float32,
     v_scale:       Float32,
     nblocks:       Int32,
@@ -65,10 +65,10 @@ def qsa_sm89_kernel(
     # block table    : [nreqs, max_pages]
 
     # Request validity
-    var req = Int(t2r_ptr[row])
+    var req = Int(t2r_ptr[unsafe_offset=row])
     var valid_req = (req >= 0) and (req < Int(nreqs))
 
-    var vc = Int(idx_ptr[row * (Int(topk) + 1) + Int(topk)])
+    var vc = Int(idx_ptr[unsafe_offset=row * (Int(topk) + 1) + Int(topk)])
     if vc < 0:
         vc = 0
     if vc > Int(topk):
@@ -77,10 +77,10 @@ def qsa_sm89_kernel(
         vc = 0
 
     # Load query
-    var qd0 = Float32(q_ptr[(row * Int(nq_heads) + q_head) * HEAD_DIM + d0])
-    var qd1 = Float32(q_ptr[(row * Int(nq_heads) + q_head) * HEAD_DIM + d1])
-    var qd2 = Float32(q_ptr[(row * Int(nq_heads) + q_head) * HEAD_DIM + d2])
-    var qd3 = Float32(q_ptr[(row * Int(nq_heads) + q_head) * HEAD_DIM + d3])
+    var qd0 = Float32(q_ptr[unsafe_offset=(row * Int(nq_heads) + q_head) * HEAD_DIM + d0])
+    var qd1 = Float32(q_ptr[unsafe_offset=(row * Int(nq_heads) + q_head) * HEAD_DIM + d1])
+    var qd2 = Float32(q_ptr[unsafe_offset=(row * Int(nq_heads) + q_head) * HEAD_DIM + d2])
+    var qd3 = Float32(q_ptr[unsafe_offset=(row * Int(nq_heads) + q_head) * HEAD_DIM + d3])
 
     # Online-softmax state
     var acc0: Float32 = 0.0
@@ -108,23 +108,23 @@ def qsa_sm89_kernel(
             var vd3: Float32 = 0.0
 
             if active:
-                var ltok = Int(idx_ptr[row * (Int(topk) + 1) + col])
+                var ltok = Int(idx_ptr[unsafe_offset=row * (Int(topk) + 1) + col])
                 var lp   = ltok // PAGE_SIZE
                 var po   = ltok %  PAGE_SIZE
-                var pb   = Int(bt_ptr[req * Int(max_pages) + max(0, min(lp, Int(max_pages) - 1))])
+                var pb   = Int(bt_ptr[unsafe_offset=req * Int(max_pages) + max(0, min(lp, Int(max_pages) - 1))])
 
                 var valid = (ltok >= 0) and (lp < Int(max_pages)) and (pb >= 0) and (pb < Int(nblocks))
                 if valid:
                     pb = max(0, min(pb, Int(nblocks) - 1))
                     var base = ((pb * PAGE_SIZE + po) * Int(nkv_heads) + kv_head) * HEAD_DIM
-                    kd0 = Float32(k_ptr[base + d0])
-                    kd1 = Float32(k_ptr[base + d1])
-                    kd2 = Float32(k_ptr[base + d2])
-                    kd3 = Float32(k_ptr[base + d3])
-                    vd0 = Float32(v_ptr[base + d0])
-                    vd1 = Float32(v_ptr[base + d1])
-                    vd2 = Float32(v_ptr[base + d2])
-                    vd3 = Float32(v_ptr[base + d3])
+                    kd0 = Float32(k_ptr[unsafe_offset=base + d0])
+                    kd1 = Float32(k_ptr[unsafe_offset=base + d1])
+                    kd2 = Float32(k_ptr[unsafe_offset=base + d2])
+                    kd3 = Float32(k_ptr[unsafe_offset=base + d3])
+                    vd0 = Float32(v_ptr[unsafe_offset=base + d0])
+                    vd1 = Float32(v_ptr[unsafe_offset=base + d1])
+                    vd2 = Float32(v_ptr[unsafe_offset=base + d2])
+                    vd3 = Float32(v_ptr[unsafe_offset=base + d3])
 
             # 4-element partial dot
             var partial = qd0 * kd0 + qd1 * kd1 + qd2 * kd2 + qd3 * kd3
@@ -163,10 +163,10 @@ def qsa_sm89_kernel(
     var ctx2 = acc2 * inv
     var ctx3 = acc3 * inv
 
-    var gd0 = Float32(gate_ptr[(row * Int(nq_heads) + q_head) * HEAD_DIM + d0])
-    var gd1 = Float32(gate_ptr[(row * Int(nq_heads) + q_head) * HEAD_DIM + d1])
-    var gd2 = Float32(gate_ptr[(row * Int(nq_heads) + q_head) * HEAD_DIM + d2])
-    var gd3 = Float32(gate_ptr[(row * Int(nq_heads) + q_head) * HEAD_DIM + d3])
+    var gd0 = Float32(gate_ptr[unsafe_offset=(row * Int(nq_heads) + q_head) * HEAD_DIM + d0])
+    var gd1 = Float32(gate_ptr[unsafe_offset=(row * Int(nq_heads) + q_head) * HEAD_DIM + d1])
+    var gd2 = Float32(gate_ptr[unsafe_offset=(row * Int(nq_heads) + q_head) * HEAD_DIM + d2])
+    var gd3 = Float32(gate_ptr[unsafe_offset=(row * Int(nq_heads) + q_head) * HEAD_DIM + d3])
 
     var sig0 = 1.0 / (1.0 + exp2(-gd0 * LOG2E))
     var sig1 = 1.0 / (1.0 + exp2(-gd1 * LOG2E))
@@ -175,15 +175,15 @@ def qsa_sm89_kernel(
 
     var out_base = (row * Int(nq_heads) + q_head) * HEAD_DIM
     if valid_req:
-        out_ptr[out_base + d0] = BFloat16(ctx0 * sig0)
-        out_ptr[out_base + d1] = BFloat16(ctx1 * sig1)
-        out_ptr[out_base + d2] = BFloat16(ctx2 * sig2)
-        out_ptr[out_base + d3] = BFloat16(ctx3 * sig3)
+        out_ptr[unsafe_offset=out_base + d0] = BFloat16(ctx0 * sig0)
+        out_ptr[unsafe_offset=out_base + d1] = BFloat16(ctx1 * sig1)
+        out_ptr[unsafe_offset=out_base + d2] = BFloat16(ctx2 * sig2)
+        out_ptr[unsafe_offset=out_base + d3] = BFloat16(ctx3 * sig3)
     else:
-        out_ptr[out_base + d0] = BFloat16(0.0)
-        out_ptr[out_base + d1] = BFloat16(0.0)
-        out_ptr[out_base + d2] = BFloat16(0.0)
-        out_ptr[out_base + d3] = BFloat16(0.0)
+        out_ptr[unsafe_offset=out_base + d0] = BFloat16(0.0)
+        out_ptr[unsafe_offset=out_base + d1] = BFloat16(0.0)
+        out_ptr[unsafe_offset=out_base + d2] = BFloat16(0.0)
+        out_ptr[unsafe_offset=out_base + d3] = BFloat16(0.0)
 
 
 # ---------------------------------------------------------------------------

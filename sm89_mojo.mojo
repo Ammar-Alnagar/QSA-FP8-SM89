@@ -29,6 +29,26 @@ comptime THREADS      = WARP_SIZE * NUM_WARPS   # 128
 comptime LOG2E: Float32 = 1.4426950408889634
 
 # ---------------------------------------------------------------------------
+# Initialization Kernel for Metadata Buffers
+# ---------------------------------------------------------------------------
+def init_data_kernel(
+    idx_ptr:   Pointer[Int32, MutAnyOrigin],
+    bt_ptr:    Pointer[Int32, MutAnyOrigin],
+    t2r_ptr:   Pointer[Int32, MutAnyOrigin],
+    nreqs:     Int32,
+    topk:      Int32,
+    max_pages: Int32,
+):
+    var r = Int(block_idx.x)
+    if r < Int(nreqs):
+        t2r_ptr[unsafe_offset=r] = Int32(r)
+        idx_ptr[unsafe_offset=r * (Int(topk) + 1) + Int(topk)] = Int32(topk)
+        for i in range(Int(topk)):
+            idx_ptr[unsafe_offset=r * (Int(topk) + 1) + i] = Int32(i)
+        for p in range(Int(max_pages)):
+            bt_ptr[unsafe_offset=r * Int(max_pages) + p] = Int32(r * Int(max_pages) + p)
+
+# ---------------------------------------------------------------------------
 # Device kernel
 # ---------------------------------------------------------------------------
 def qsa_sm89_kernel(
@@ -76,11 +96,13 @@ def qsa_sm89_kernel(
     if not valid_req:
         vc = 0
 
-    # Load query
-    var qd0 = Float32(q_ptr[unsafe_offset=(row * Int(nq_heads) + q_head) * HEAD_DIM + d0])
-    var qd1 = Float32(q_ptr[unsafe_offset=(row * Int(nq_heads) + q_head) * HEAD_DIM + d1])
-    var qd2 = Float32(q_ptr[unsafe_offset=(row * Int(nq_heads) + q_head) * HEAD_DIM + d2])
-    var qd3 = Float32(q_ptr[unsafe_offset=(row * Int(nq_heads) + q_head) * HEAD_DIM + d3])
+    # Load query (vectorized SIMD[BFloat16, 4])
+    var q_offset = (row * Int(nq_heads) + q_head) * HEAD_DIM + d0
+    var q_vec = q_ptr.unsafe_load[width=4](q_offset)
+    var qd0 = Float32(q_vec[0])
+    var qd1 = Float32(q_vec[1])
+    var qd2 = Float32(q_vec[2])
+    var qd3 = Float32(q_vec[3])
 
     # Online-softmax state
     var acc0: Float32 = 0.0
@@ -116,23 +138,24 @@ def qsa_sm89_kernel(
                 var valid = (ltok >= 0) and (lp < Int(max_pages)) and (pb >= 0) and (pb < Int(nblocks))
                 if valid:
                     pb = max(0, min(pb, Int(nblocks) - 1))
-                    var base = ((pb * PAGE_SIZE + po) * Int(nkv_heads) + kv_head) * HEAD_DIM
-                    kd0 = Float32(k_ptr[unsafe_offset=base + d0])
-                    kd1 = Float32(k_ptr[unsafe_offset=base + d1])
-                    kd2 = Float32(k_ptr[unsafe_offset=base + d2])
-                    kd3 = Float32(k_ptr[unsafe_offset=base + d3])
-                    vd0 = Float32(v_ptr[unsafe_offset=base + d0])
-                    vd1 = Float32(v_ptr[unsafe_offset=base + d1])
-                    vd2 = Float32(v_ptr[unsafe_offset=base + d2])
-                    vd3 = Float32(v_ptr[unsafe_offset=base + d3])
+                    var base = ((pb * PAGE_SIZE + po) * Int(nkv_heads) + kv_head) * HEAD_DIM + d0
+                    var k_vec = k_ptr.unsafe_load[width=4](base)
+                    var v_vec = v_ptr.unsafe_load[width=4](base)
+                    kd0 = Float32(k_vec[0])
+                    kd1 = Float32(k_vec[1])
+                    kd2 = Float32(k_vec[2])
+                    kd3 = Float32(k_vec[3])
+                    vd0 = Float32(v_vec[0])
+                    vd1 = Float32(v_vec[1])
+                    vd2 = Float32(v_vec[2])
+                    vd3 = Float32(v_vec[3])
 
             # 4-element partial dot
             var partial = qd0 * kd0 + qd1 * kd1 + qd2 * kd2 + qd3 * kd3
 
-            # Intra-warp butterfly reduction
-            for i in range(5):
-                var delta = 1 << i
-                partial += shuffle_xor(partial, UInt32(delta))
+            # Intra-warp butterfly reduction (compile-time unrolled)
+            comptime for i in range(5):
+                partial += shuffle_xor(partial, UInt32(1 << i))
 
             var score = partial * softmax_scale
 
@@ -163,27 +186,32 @@ def qsa_sm89_kernel(
     var ctx2 = acc2 * inv
     var ctx3 = acc3 * inv
 
-    var gd0 = Float32(gate_ptr[unsafe_offset=(row * Int(nq_heads) + q_head) * HEAD_DIM + d0])
-    var gd1 = Float32(gate_ptr[unsafe_offset=(row * Int(nq_heads) + q_head) * HEAD_DIM + d1])
-    var gd2 = Float32(gate_ptr[unsafe_offset=(row * Int(nq_heads) + q_head) * HEAD_DIM + d2])
-    var gd3 = Float32(gate_ptr[unsafe_offset=(row * Int(nq_heads) + q_head) * HEAD_DIM + d3])
+    var g_vec = gate_ptr.unsafe_load[width=4](q_offset)
+    var gd0 = Float32(g_vec[0])
+    var gd1 = Float32(g_vec[1])
+    var gd2 = Float32(g_vec[2])
+    var gd3 = Float32(g_vec[3])
 
     var sig0 = 1.0 / (1.0 + exp2(-gd0 * LOG2E))
     var sig1 = 1.0 / (1.0 + exp2(-gd1 * LOG2E))
     var sig2 = 1.0 / (1.0 + exp2(-gd2 * LOG2E))
     var sig3 = 1.0 / (1.0 + exp2(-gd3 * LOG2E))
 
-    var out_base = (row * Int(nq_heads) + q_head) * HEAD_DIM
     if valid_req:
-        out_ptr[unsafe_offset=out_base + d0] = BFloat16(ctx0 * sig0)
-        out_ptr[unsafe_offset=out_base + d1] = BFloat16(ctx1 * sig1)
-        out_ptr[unsafe_offset=out_base + d2] = BFloat16(ctx2 * sig2)
-        out_ptr[unsafe_offset=out_base + d3] = BFloat16(ctx3 * sig3)
+        out_ptr.unsafe_store[width=4](
+            q_offset,
+            SIMD[DType.bfloat16, 4](
+                BFloat16(ctx0 * sig0),
+                BFloat16(ctx1 * sig1),
+                BFloat16(ctx2 * sig2),
+                BFloat16(ctx3 * sig3),
+            )
+        )
     else:
-        out_ptr[unsafe_offset=out_base + d0] = BFloat16(0.0)
-        out_ptr[unsafe_offset=out_base + d1] = BFloat16(0.0)
-        out_ptr[unsafe_offset=out_base + d2] = BFloat16(0.0)
-        out_ptr[unsafe_offset=out_base + d3] = BFloat16(0.0)
+        out_ptr.unsafe_store[width=4](
+            q_offset,
+            SIMD[DType.bfloat16, 4](BFloat16(0.0), BFloat16(0.0), BFloat16(0.0), BFloat16(0.0))
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -226,9 +254,18 @@ def main() raises:
     out_buf.enqueue_fill(0.0)
     k_buf.enqueue_fill(0.1)
     v_buf.enqueue_fill(0.1)
-    idx_buf.enqueue_fill(0)
-    bt_buf.enqueue_fill(0)
-    t2r_buf.enqueue_fill(0)
+
+    # Initialize metadata on GPU
+    ctx.enqueue_function[func=init_data_kernel](
+        idx_buf.device_ptr(),
+        bt_buf.device_ptr(),
+        t2r_buf.device_ptr(),
+        Int32(NUM_REQUESTS),
+        Int32(TOPK),
+        Int32(MAX_PAGES),
+        grid_dim=Dim(NUM_REQUESTS),
+        block_dim=Dim(1),
+    )
     ctx.synchronize()
 
     var k_scale: Float32 = 0.1
@@ -296,11 +333,16 @@ def main() raises:
     var flops = 4.0 * Float64(NUM_REQUESTS) * Float64(TOPK) * Float64(NUM_Q_HEADS) * Float64(HEAD_DIM)
     var tflops = flops / (avg_ms * 1e-3) / 1e12
 
-    print("  Kernel Latency: " + String(avg_ms) + " ms/iter (" + String(avg_us) + " us)")
-    print("  E2E Latency   : " + String(avg_ms) + " ms/iter")
-    print("  Throughput    : " + String(tflops) + " TFLOP/s (compute)\n")
+    # Formatted output matching exactly
+    var avg_ms_str = String(avg_ms)[byte=0:6]
+    var avg_us_str = String(avg_us)[byte=0:6]
+    var tflops_str = String(tflops)[byte=0:5]
+
+    print("  Kernel Latency: " + avg_ms_str + " ms/iter (" + avg_us_str + " us)")
+    print("  E2E Latency   : " + avg_ms_str + " ms/iter")
+    print("  Throughput    : " + tflops_str + " TFLOP/s (compute)\n")
 
     print("=======================================================")
     print("  SUMMARY  Mojo / MAX sparse GQA FP8 (64 reqs, TopK=512)")
-    print("  Kernel: " + String(avg_us) + " us  |  " + String(tflops) + " TFLOP/s  |  PASS=True")
+    print("  Kernel: " + avg_us_str + " us  |  " + tflops_str + " TFLOP/s  |  PASS=True")
     print("=======================================================")

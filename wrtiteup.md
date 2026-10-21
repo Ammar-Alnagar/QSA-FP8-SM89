@@ -1262,31 +1262,25 @@ Key Mojo-specific implementation notes:
 
 ## 11. Key Takeaways for GPU Kernel Engineers on Ada Lovelace
 
-1. **GQA Is Inherently Tile-Friendly**: If your model architecture uses Grouped-Query Attention ($G = 4$ or $8$), never launch one CTA per query head. Launching one CTA per KV head and having warps cooperate on the shared KV cache lines turns cache misses into L1 hits ($49.8\% \to 93.9\%$).
-2. **Warp-Level Self-Containment Beats Shared Memory**: If your vector length ($D = 128$) fits into 32 threads $\times$ 4 elements, keep the whole dot product inside one warp. Replacing cross-warp tree reductions with intra-warp butterfly shuffles removed 1,024 synchronization barriers per block and freed all shared memory.
-3. **Always Precompile CuTe DSL (`cute.compile`)**: Never evaluate `@cute.jit` functions directly inside high-frequency benchmark loops without `cute.compile`. CuTe DSL's Python AST inspection will cost 40 ms of host CPU overhead, masking true GPU kernel execution times.
-4. **Mind Independent Thread Scheduling**: In modern architectures (Volta through Ada Lovelace), `__shfl_sync` will permanently deadlock your GPU if executed inside a conditional branch where not all masked lanes participate.
-5. **Fold Floating-Point Scales**: Any constant scale factor ($v\_\text{scale}$) that is mathematically distributive over the accumulator should be folded into the post-loop normalization scalar. It saved us 512 floating-point multiplications per lane.
-6. **Raw CUDA C++ Reaches the Ultimate Peak**: While CuTe DSL provides an elegant Pythonic abstraction achieving 1.12 ms ($3.04\times$ speedup), dropping to raw CUDA C++ with inline PTX `cvt.rn.f16x2.e4m3x2` and 32-bit pointer casting pushes latency down to **0.74 ms ($4.61\times$ speedup)** with **2.88 active IPC** and only **34 registers per thread**.
-
----
-
-## 11. Artifact Catalog & Instructions to Run
-
 ### Run CuTe DSL Optimized Kernel:
 ```bash
-.venv/bin/python sm89_cutedsl.py
+python3 sm89_cutedsl.py
 ```
 
 ### Run Baseline Comparison Kernel:
 ```bash
-.venv/bin/python backup.py
+python3 backup.py
 ```
 
 ### Compile & Run Raw CUDA C++ Optimized Kernel:
 ```bash
 nvcc -O3 -arch=sm_89 -lineinfo sm89_cuda.cu -o sm89_cuda
 ./sm89_cuda
+```
+
+### Run Mojo / MAX SM89 Kernel:
+```bash
+mojo sm89_mojo.mojo
 ```
 
 ### Inspect NCU Profiling Artifacts:

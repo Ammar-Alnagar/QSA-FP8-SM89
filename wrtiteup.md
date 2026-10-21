@@ -95,18 +95,38 @@ $$\text{Context Vector} = \frac{\text{acc}_{\text{final}}}{\max(\ell_{\text{fina
 
 ### 2.3 Mathematical Optimization: Scale Folding
 In standard attention, Key and Value vectors must be dequantized from FP8 to float32:
-$$K_{\text{float}} = K_{\text{fp8}} \times k_{\text{scale}}, \quad V_{\text{float}} = V_{\text{fp8}} \times v_{\text{scale}}$$
+
+$$
+K_{\text{float}} = K_{\text{fp8}} \times k_{\text{scale}}, \quad V_{\text{float}} = V_{\text{fp8}} \times v_{\text{scale}}
+$$
 
 Rather than performing multiplications by $k_{\text{scale}}$ and $v_{\text{scale}}$ inside the hot inner token loop:
 1. **$k_{\text{scale}}$ is folded into `softmax_scale`**:
-   $$\text{softmax\_scale} = \left(\frac{1}{\sqrt{D}} \times k_{\text{scale}}\right) \times \log_2(e)$$
+
+   $$
+   \text{softmax\_scale} = \left(\frac{1}{\sqrt{D}} \times k_{\text{scale}}\right) \times \log_2(e)
+   $$
+
    By incorporating $\log_2(e) \approx 1.44269504$, the dot product directly yields powers of 2, allowing the GPU's Special Function Unit (SFU) to evaluate $2^x$ in a single hardware cycle via the `ex2.approx.f32` instruction.
+
 2. **$v_{\text{scale}}$ is folded into the post-loop normalizer**:
+
    Because Value accumulation is linear:
-   $$\sum_i p_i (V_i \times v_{\text{scale}}) = v_{\text{scale}} \times \left(\sum_i p_i V_i\right)$$
+
+   $$
+   \sum_i p_i (V_i \times v_{\text{scale}}) = v_{\text{scale}} \times \left(\sum_i p_i V_i\right)
+   $$
+
    We accumulate raw unscaled $V_i$ values inside the loop, and multiply by $v_{\text{scale}}$ **only once** during final output normalization:
-   $$\text{inv\_norm} = \frac{v_{\text{scale}}}{\max(\ell_{\text{final}}, 10^{-20})}$$
-   $$\text{Context}_d = \text{acc}_d \times \text{inv\_norm}$$
+
+   $$
+   \text{inv\_norm} = \frac{v_{\text{scale}}}{\max(\ell_{\text{final}}, 10^{-20})}
+   $$
+
+   $$
+   \text{Context}_d = \text{acc}_d \times \text{inv\_norm}
+   $$
+
    This eliminates 512 floating-point multiplications per lane.
 
 ---

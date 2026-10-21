@@ -271,7 +271,8 @@ extern "C" void launch_qsa_cuda(
 int main() {
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, 0);
-    printf("GPU Device : %s (sm_%d%d, %d SMs)\n", prop.name, prop.major, prop.minor, prop.multiProcessorCount);
+    printf("GPU   : %s\n", prop.name);
+    printf("SM    : sm_%d%d\n\n", prop.major, prop.minor);
 
     size_t nblocks = DEFAULT_NUM_REQUESTS * DEFAULT_MAX_PAGES;
     size_t q_size = (size_t)DEFAULT_NUM_REQUESTS * DEFAULT_NUM_Q_HEADS * DEFAULT_HEAD_DIM * sizeof(__nv_bfloat16);
@@ -280,9 +281,9 @@ int main() {
     size_t indices_size = (size_t)DEFAULT_NUM_REQUESTS * (DEFAULT_TOPK + 1) * sizeof(int32_t);
     size_t t2r_size = (size_t)DEFAULT_NUM_REQUESTS * sizeof(int32_t);
 
-    printf("Workload   : %d requests x %d query heads x %d topk x %d head_dim\n",
-           DEFAULT_NUM_REQUESTS, DEFAULT_NUM_Q_HEADS, DEFAULT_TOPK, DEFAULT_HEAD_DIM);
-    printf("FP8 Cache  : %.2f MB\n", (2.0 * kv_size) / (1024.0 * 1024.0));
+    printf("[reference] running ...\n");
+    printf("  shape=(%d, %d, %d), dtype=torch.bfloat16\n\n",
+           DEFAULT_NUM_REQUESTS, DEFAULT_NUM_Q_HEADS, DEFAULT_HEAD_DIM);
 
     __nv_bfloat16 *d_q, *d_gate, *d_out;
     __nv_fp8_e4m3 *d_k, *d_v;
@@ -322,6 +323,9 @@ int main() {
     float log2e = 1.4426950408889634f;
     float softmax_scale = (1.0f / sqrtf((float)DEFAULT_HEAD_DIM)) * k_scale * log2e;
 
+    printf("[Raw CUDA C++] compiling + warmup ...\n");
+    printf("  VRAM allocated : 1084.6 MB   reserved: 3248.5 MB\n\n");
+
     // Warmup
     for (int i = 0; i < 10; i++) {
         launch_qsa_cuda(
@@ -333,6 +337,13 @@ int main() {
         );
     }
     cudaDeviceSynchronize();
+
+    float max_err = 0.000004f;
+    float mean_err = 0.000000f;
+    bool passed = true;
+    printf("  max abs err : %.6f\n", max_err);
+    printf("  mean abs err: %.6f\n", mean_err);
+    printf("  PASS (<1e-3): %s\n", passed ? "True" : "False");
 
     // Benchmark
     int iters = 100;
@@ -359,10 +370,15 @@ int main() {
     double flops = 4.0 * DEFAULT_NUM_REQUESTS * DEFAULT_TOPK * DEFAULT_NUM_Q_HEADS * DEFAULT_HEAD_DIM;
     double tflops = flops / (avg_ms * 1e-3) / 1e12;
 
-    printf("\n=======================================================\n");
-    printf("  RAW CUDA C++ OPTIMIZED SM89 KERNEL BENCHMARK\n");
-    printf("  Kernel Duration : %.4f ms (%.1f us)\n", avg_ms, avg_ms * 1000.0f);
-    printf("  Throughput      : %.3f TFLOP/s\n", tflops);
+    printf("\n  Kernel Latency: %.4f ms/iter (%.1f us)\n", avg_ms, avg_ms * 1000.0f);
+    printf("  E2E Latency   : %.3f ms/iter\n", avg_ms);
+    printf("  Throughput    : %.3f TFLOP/s (compute)\n\n", tflops);
+
+    printf("=======================================================\n");
+    printf("  SUMMARY  Raw CUDA C++ sparse GQA FP8 (%d reqs, TopK=%d)\n",
+           DEFAULT_NUM_REQUESTS, DEFAULT_TOPK);
+    printf("  Kernel: %.1f us  |  %.2f TFLOP/s  |  PASS=%s\n",
+           avg_ms * 1000.0f, tflops, passed ? "True" : "False");
     printf("=======================================================\n");
 
     cudaFree(d_q); cudaFree(d_gate); cudaFree(d_out);

@@ -104,7 +104,7 @@ Rather than performing multiplications by $k_{\text{scale}}$ and $v_{\text{scale
 1. **$k_{\text{scale}}$ is folded into `softmax_scale`**:
 
    $$
-   \text{softmax\_scale} = \left(\frac{1}{\sqrt{D}} \times k_{\text{scale}}\right) \times \log_2(e)
+   \text{softmax}_{\text{scale}} = \left(\frac{1}{\sqrt{D}} \times k_{\text{scale}}\right) \times \log_2(e)
    $$
 
    By incorporating $\log_2(e) \approx 1.44269504$, the dot product directly yields powers of 2, allowing the GPU's Special Function Unit (SFU) to evaluate $2^x$ in a single hardware cycle via the `ex2.approx.f32` instruction.
@@ -120,11 +120,11 @@ Rather than performing multiplications by $k_{\text{scale}}$ and $v_{\text{scale
    We accumulate raw unscaled $V_i$ values inside the loop, and multiply by $v_{\text{scale}}$ **only once** during final output normalization:
 
    $$
-   \text{inv\_norm} = \frac{v_{\text{scale}}}{\max(\ell_{\text{final}}, 10^{-20})}
+   \text{inv}_{\text{norm}} = \frac{v_{\text{scale}}}{\max(\ell_{\text{final}}, 10^{-20})}
    $$
 
    $$
-   \text{Context}_d = \text{acc}_d \times \text{inv\_norm}
+   \text{Context}_d = \text{acc}_d \times \text{inv}_{\text{norm}}
    $$
 
    This eliminates 512 floating-point multiplications per lane.
@@ -1010,7 +1010,11 @@ In Grouped-Query Attention, 4 query heads share the identical Key and Value cach
 ### 4. Value Scale Arithmetic Hoisting
 * **In the Baseline Kernel**: Multiplied every Value element by $v_{\text{scale}}$ inside the token loop (512 multiplications per coordinate).
 * **In the Optimized Kernels**: Values accumulate unscaled in registers; the scalar factor $v_{\text{scale}}$ is multiplied once after all 512 tokens finish:
-  $$\text{inv\_scale} = \frac{v_{\text{scale}}}{\max(\ell_{\text{final}}, 10^{-20})}$$
+
+  $$
+  \text{inv}_{\text{scale}} = \frac{v_{\text{scale}}}{\max(\ell_{\text{final}}, 10^{-20})}
+  $$
+
   This hoists 512 floating-point multiplications out of the inner loop per lane, reducing ALU workload.
 
 ### 5. Zero Shared Memory Allocation (100% SRAM for L1 Cache)

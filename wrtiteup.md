@@ -1,6 +1,5 @@
 # Sparse Paged GQA FP8 Kernels on SM89
 
-**Author:** Ammar Alnagar
 
 **Target used for the reported run:** NVIDIA GeForce RTX 4060 Laptop GPU, compute capability 8.9 (Ada Lovelace), 8 GiB VRAM
 

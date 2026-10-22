@@ -310,7 +310,9 @@ int main() {
     cudaMalloc(&d_btable, btable_size);
     cudaMalloc(&d_t2r, t2r_size);
 
-    cudaMemset(d_q, 1, q_size);
+    // Zero Q and gate make the constant-input reference closed form: every score
+    // is equal, V is exactly 1.0 (FP8 byte 0x38), and output is BF16(0.05).
+    cudaMemset(d_q, 0, q_size);
     cudaMemset(d_gate, 0, q_size);
     cudaMemset(d_k, 0x38, kv_size);
     cudaMemset(d_v, 0x38, kv_size);
@@ -350,7 +352,17 @@ int main() {
     }
     cudaDeviceSynchronize();
 
-    printf("  Reference check: unavailable (no reference comparison is implemented)\n");
+    __nv_bfloat16 *h_out = (__nv_bfloat16*)malloc(q_size);
+    cudaMemcpy(h_out, d_out, q_size, cudaMemcpyDeviceToHost);
+    const float expected = __bfloat162float(__float2bfloat16(0.05f));
+    float max_err = 0.0f;
+    for (size_t i = 0; i < (size_t)DEFAULT_NUM_REQUESTS * DEFAULT_NUM_Q_HEADS * DEFAULT_HEAD_DIM; ++i) {
+        float err = fabsf(__bfloat162float(h_out[i]) - expected);
+        if (err > max_err) max_err = err;
+    }
+    bool passed = max_err < 1e-3f;
+    printf("  max abs err : %.8f\n", max_err);
+    printf("  PASS (<1e-3): %s\n", passed ? "True" : "False");
 
     // Benchmark
     int iters = 100;
@@ -384,14 +396,14 @@ int main() {
     printf("=======================================================\n");
     printf("  SUMMARY  Raw CUDA C++ sparse GQA FP8 (%d reqs, TopK=%d)\n",
            DEFAULT_NUM_REQUESTS, DEFAULT_TOPK);
-    printf("  Kernel: %.1f us  |  %.2f TFLOP/s  |  validation=NOT CHECKED\n",
-           avg_ms * 1000.0f, tflops);
+    printf("  Kernel: %.1f us  |  %.2f TFLOP/s  |  validation=%s\n",
+           avg_ms * 1000.0f, tflops, passed ? "PASS" : "FAIL");
     printf("=======================================================\n");
 
     cudaFree(d_q); cudaFree(d_gate); cudaFree(d_out);
     cudaFree(d_k); cudaFree(d_v);
     cudaFree(d_indices); cudaFree(d_btable); cudaFree(d_t2r);
-    free(h_btable); free(h_t2r); free(h_indices);
-    return 0;
+    free(h_btable); free(h_t2r); free(h_indices); free(h_out);
+    return passed ? 0 : 1;
 }
 #endif

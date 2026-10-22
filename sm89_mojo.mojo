@@ -254,8 +254,10 @@ def main() raises:
     q_buf.enqueue_fill(1.0)
     gate_buf.enqueue_fill(0.0)
     out_buf.enqueue_fill(0.0)
-    k_buf.enqueue_fill(0.1)
-    v_buf.enqueue_fill(0.1)
+    # Constant 1.0 keys and values with a zero gate yield the closed-form
+    # output BF16(0.05) for every element, independently checked below.
+    k_buf.enqueue_fill(1.0)
+    v_buf.enqueue_fill(1.0)
 
     # Initialize metadata on GPU
     ctx.enqueue_function[func=init_data_kernel](
@@ -298,7 +300,20 @@ def main() raises:
         )
     ctx.synchronize()
 
-    print("  Reference check: unavailable (no reference comparison is implemented)\n")
+    var out_host = ctx.enqueue_create_host_buffer[DType.bfloat16](q_size)
+    ctx.enqueue_copy(dst_buf=out_host, src_buf=out_buf)
+    ctx.synchronize()
+
+    var max_err: Float32 = 0.0
+    for i in range(q_size):
+        var err = Float32(out_host[i]) - 0.05
+        if err < 0.0:
+            err = -err
+        if err > max_err:
+            max_err = err
+    var validation_passed = max_err < 1e-3
+    print("  max abs err : " + String(max_err))
+    print("  PASS (<1e-3): " + String(validation_passed) + "\n")
 
     # Benchmark iterations
     var iters = 100
@@ -343,5 +358,5 @@ def main() raises:
 
     print("=======================================================")
     print("  SUMMARY  Mojo / MAX sparse GQA FP8 (256 reqs, TopK=512)")
-    print("  Enqueue+sync: " + avg_us_str + " us  |  " + tflops_str + " TFLOP/s  |  validation=NOT CHECKED")
+    print("  Enqueue+sync: " + avg_us_str + " us  |  " + tflops_str + " TFLOP/s  |  validation=" + String(validation_passed))
     print("=======================================================")

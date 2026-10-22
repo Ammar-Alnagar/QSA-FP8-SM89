@@ -84,7 +84,7 @@ The measured order is **Triton → raw CUDA → optimized CuTe → baseline CuTe
 
 The K/V cache allocation is **256 MiB** (128 MiB each for K and V). Each query head's warp/program processes a 128 KiB K/V slice for its 512 selected tokens. The four fused custom kernels request about **1 GiB of logical K/V payload per invocation**: grouped kernels still issue per-warp K/V loads, and per-query-head kernels each load the corresponding rows. Grouping reduces CTA count from 8,192 to 2,048 but does not share these loads. The PyTorch eager baseline gathers each selected K/V row once per KV head and reuses that gathered tensor across the four query heads, for about **256 MiB of logical K/V payload**, with much larger temporary FP32 tensors. These are logical requested bytes, not measured DRAM bytes; cache reuse can reduce physical traffic. Q and output each occupy about 2 MiB, while gate and index/block-table metadata are smaller.
 
-![Diagram comparing grouped and per-query-head CTA mappings and their logical K/V payload](charts/kv_data_movement.png)
+![Diagram comparing the PyTorch eager gather with fused-kernel K/V loads and their logical payload](charts/kv_data_movement.png)
 
 ![Nsight Compute achieved occupancy and DRAM throughput counters](charts/ncu_utilization.png)
 

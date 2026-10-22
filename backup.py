@@ -15,14 +15,14 @@ import torch
 from cutlass.utils import create_cute_tensor_for_fp8
 
 # ── config ──────────────────────────────────────────────────────────────────
-NUM_REQUESTS = 64
+NUM_REQUESTS = 256
 NUM_Q_HEADS = 32
 NUM_KV_HEADS = 8
 GROUP_SIZE = NUM_Q_HEADS // NUM_KV_HEADS  # 4
 HEAD_DIM = 128
 PAGE_SIZE = 16
-MAX_PAGES = 512
 TOPK = 512
+MAX_PAGES = TOPK // PAGE_SIZE
 BLOCK_N = 32
 
 WARMUP = 5 if "--profile" in sys.argv else 10

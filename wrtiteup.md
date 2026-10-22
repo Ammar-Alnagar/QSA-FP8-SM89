@@ -4,11 +4,11 @@
 
 **Target used for the reported run:** NVIDIA GeForce RTX 4060 Laptop GPU, compute capability 8.9 (Ada Lovelace), 8 GiB VRAM
 
-**Run date:** October 21, 2026
+**Original run date:** October 21, 2026 (historical 64-request workload)
 
-**Workload:** 64 requests, 32 query heads, 8 KV heads, head dimension 128, Top-K 512, BF16 query/gate/output, FP8 E4M3FN K/V cache.
+**Current test workload:** 256 requests, 32 query heads, 8 KV heads, head dimension 128, Top-K 512, BF16 query/gate/output, FP8 E4M3FN K/V cache, page size 16, and 32 pages per request.
 
-This report describes the implementations in this repository and records the latest benchmark output supplied for them. It separates that run from the saved Nsight Compute reports: the Nsight captures are older measurements and do not reproduce all of the latest timings.
+This report describes the implementations and the larger test shape now configured in the sources. The current environment has no visible CUDA GPU (`torch.cuda` reports no available devices and `nvidia-smi` cannot reach the driver), so no latency or Nsight Compute numbers have been measured for the new shape. The figures below are retained only as historical results from the old 64-request shape; they must not be used as measurements for the current workload.
 
 ## Implementations
 
@@ -21,11 +21,13 @@ All four implement the same intended operation for valid inputs: sparse scaled d
 
 ## Workload and math
 
-The synthetic setup uses 64 requests × 512 pages/request × 16 tokens/page, with 8 KV heads and 128 values per head. The physical K cache and V cache each contain:
+The current synthetic setup uses 256 requests × 32 pages/request × 16 tokens/page, with 8 KV heads and 128 values per head. Since 32 pages cover Top-K 512, this removes the prior allocation of 512 pages per request while preserving the selected-token workload. The physical K cache and V cache each contain:
 
-`64 × 512 × 16 × 8 × 128 = 536,870,912` FP8 bytes (512 MiB).
+`256 × 32 × 16 × 8 × 128 = 134,217,728` FP8 bytes (128 MiB).
 
-Together they occupy 1 GiB (1,073,741,824 bytes), before query, output, metadata, allocator overhead, and temporary allocations. The selected Top-K is 512 per request. In the provided setup, indices select the first 512 logical tokens and the block table maps each request to its own contiguous set of physical pages.
+Together they occupy 256 MiB, before query, output, metadata, allocator overhead, and temporary allocations. The selected Top-K is 512 per request. Indices select the first 512 logical tokens and the block table maps each request to its own contiguous physical pages.
+
+The grouped CuTe/CUDA/Mojo launch has 256 × 8 = 2,048 CTAs; the baseline has 256 × 32 = 8,192. These provide substantially more independent blocks than the previous 512/2,048-block setup. CTA count alone does not prove full occupancy: achieved occupancy and utilization require a live GPU profile.
 
 For request `r`, query head `h`, and its KV head `g = floor(h / 4)`, the kernel computes scores from `Q[r,h] · (K[token,g] × k_scale) / sqrt(128)`, normalizes across the selected tokens, accumulates the corresponding scaled values, and multiplies each output element by `sigmoid(gate[r,h])`. The query/key and value reductions use float32 accumulators; output is stored as BF16.
 
@@ -37,21 +39,21 @@ The nominal operation count used by the scripts is `4 × B × TopK × Hq × D = 
 
 ### Optimized CuTe DSL and CUDA
 
-Both use a grid of `[64, 8, 1]` and 128 threads per CTA. Four warps correspond to the four query heads in a GQA group. Each lane owns four adjacent dimensions (`4 × lane + {0,1,2,3}`), so one warp covers all 128 dimensions of one query head. It computes a four-element partial dot product and reduces it across 32 lanes with five butterfly shuffles. This avoids cross-warp reduction and shared memory for QK.
+Both use a grid of `[256, 8, 1]` and 128 threads per CTA. Four warps correspond to the four query heads in a GQA group. Each lane owns four adjacent dimensions (`4 × lane + {0,1,2,3}`), so one warp covers all 128 dimensions of one query head. It computes a four-element partial dot product and reduces it across 32 lanes with five butterfly shuffles. This avoids cross-warp reduction and shared memory for QK.
 
 The token loop resolves a logical token into page and offset, looks up the physical page in the block table, loads K and V, updates the online softmax maximum/normalizer, and updates four per-lane output accumulators. The CUDA implementation explicitly packs four FP8 bytes into a 32-bit load and uses `cvt.rn.f16x2.e4m3x2`; the CuTe implementation indexes FP8 values through CUTLASS tensor wrappers. The source establishes these load/conversion choices; it does not by itself establish a particular cycle count or prove that a given instruction is the performance bottleneck.
 
 ### Baseline CuTe DSL
 
-The baseline launch grid is `[64, 32, 1]`, with one CTA per query head. The four warps split the 128 dimensions and use shared memory plus block synchronization to combine their partial dot products. This repeats K/V work for query heads that share a KV head and launches four times as many CTAs as the grouped mapping (2,048 instead of 512).
+The baseline launch grid is `[256, 32, 1]`, with one CTA per query head. The four warps split the 128 dimensions and use shared memory plus block synchronization to combine their partial dot products. This repeats K/V work for query heads that share a KV head and launches four times as many CTAs as the grouped mapping (8,192 instead of 2,048).
 
 ### Mojo / MAX
 
-Mojo also launches `[64, 8, 1]` with 128 threads per CTA and maps a warp to a query head. Its source uses `BLOCK_N = 16`, `unsafe_load[width=4]` for vector elements, and a compile-time five-step shuffle reduction. The benchmark uses `perf_counter_ns` around 100 enqueues followed by `ctx.synchronize()`, so its reported latency includes host/runtime enqueue cost as well as GPU execution. It is not directly comparable to the CUDA-event kernel timings as a pure device duration.
+Mojo also launches `[256, 8, 1]` with 128 threads per CTA and maps a warp to a query head. Its source uses `BLOCK_N = 16`, `unsafe_load[width=4]` for vector elements, and a compile-time five-step shuffle reduction. The benchmark uses `perf_counter_ns` around 100 enqueues followed by `ctx.synchronize()`, so its reported latency includes host/runtime enqueue cost as well as GPU execution. It is not directly comparable to the CUDA-event kernel timings as a pure device duration.
 
-## Latest supplied benchmark run
+## Historical 64-request benchmark run
 
-The following values are transcribed from the run supplied with this update. CuTe and CUDA report CUDA-event kernel timing; their E2E columns are the scripts' separate end-to-end measurements. Mojo's timing is host wall-clock time around enqueueing and synchronization, despite the printed `Kernel Latency` label.
+The following values are transcribed from the earlier 64-request run. They do not measure the current 256-request configuration. CuTe and CUDA report CUDA-event kernel timing; their E2E columns are the scripts' separate end-to-end measurements. Mojo's timing is host wall-clock time around enqueueing and synchronization, despite the printed `Kernel Latency` label.
 
 | Implementation | Kernel / timed interval | E2E reported | Derived throughput | Printed validation |
 |---|---:|---:|---:|---|
@@ -62,13 +64,13 @@ The following values are transcribed from the run supplied with this update. CuT
 
 `*` The Mojo source currently prints these validation numbers rather than calculating them. Its timing also includes runtime enqueue overhead, so the table does not support a direct pure-kernel speed ranking for Mojo.
 
-Using the latest CuTe event timings, optimized CuTe is about **3.16× faster** than the baseline (`2.5078 / 0.7933`). Raw CUDA is about **2.50× faster** than the baseline and about **1.27× slower** than optimized CuTe in this run. The older saved Nsight CUDA duration for optimized CuTe was 1.12 ms, while this run reports 0.7933 ms; these are different captures and should not be combined as if they were measured in one session.
+For that old shape, optimized CuTe was about **3.16× faster** than the baseline (`2.5078 / 0.7933`). Raw CUDA was about **2.50× faster** than baseline and about **1.27× slower** than optimized CuTe in that run. These ratios do not establish performance at 256 requests.
 
 The supplied `nvidia-smi` snapshot reports driver 595.91.07, CUDA 13.2, GPU memory capacity 8,188 MiB, and 76 MiB in use after the scripts exited. This is a post-run idle snapshot, not a measurement of each process's peak allocation. The scripts print 1,084.6 MB allocated and 3,248.5 MB reserved during their run.
 
 ## Saved Nsight Compute captures
 
-The three `.ncu-rep` files in the repository are older captures. Reading their recorded metrics with Nsight Compute gives:
+The three `.ncu-rep` files in the repository are older captures of the 64-request shape. Reading their recorded metrics with Nsight Compute gives:
 
 | Capture | Grid | Duration | L1/TEX hit rate | Registers/thread | Dynamic shared memory/block |
 |---|---:|---:|---:|---:|---:|
@@ -76,7 +78,7 @@ The three `.ncu-rep` files in the repository are older captures. Reading their r
 | `qsa_sm89_cutedsl.ncu-rep` | 64 × 8 CTAs | 1.12 ms | 93.90% | 38 | 0 B |
 | `qsa_sm89_raw_cuda.ncu-rep` | 64 × 8 CTAs | 1.00 ms | 79.29% | 34 | 0 B |
 
-These reports support the observed differences in CTA mapping, register count, shared-memory allocation, and the recorded L1/TEX hit rates for those specific captures. They do not include a Mojo capture. The reports also show equal grid/block dimensions for optimized CuTe and CUDA, and an L1/TEX hit rate that differs between those captures; therefore the hit rate should not be presented as identical across implementations or used alone to explain runtime. NCU's replay and collection settings can affect measurements, and these artifacts are not contemporaneous with the latest supplied timing run.
+These reports support the observed differences in CTA mapping, register count, shared-memory allocation, and the recorded L1/TEX hit rates for those specific captures. They do not include a Mojo capture. The reports also show equal grid/block dimensions for optimized CuTe and CUDA, and an L1/TEX hit rate that differs between those captures; therefore the hit rate should not be presented as identical across implementations or used alone to explain runtime. These artifacts are not profiles of the current 256-request shape.
 
 The older values previously presented as Mojo NCU metrics, including estimated hit rates, bandwidth, register counts, barrier counts, and IPC, are not backed by a Mojo Nsight report in this repository and have been removed. Likewise, claims about exact cycle savings, bus burst utilization, compiler scheduling superiority, and causal attribution of the speed difference are not established by the available source and reports.
 
@@ -97,4 +99,10 @@ cudarun sm89_cuda.cu
 mojo sm89_mojo.mojo
 ```
 
-The checked-in Nsight reports can be opened in Nsight Compute with `ncu-ui <report>.ncu-rep`. Their recorded performance numbers should be cited as saved capture results, not as replacements for the latest benchmark table above.
+Profile the optimized CuTe kernel after the GPU is visible to the process:
+
+```bash
+ncu --set basic --target-processes all .venv/bin/python sm89_cutedsl.py --profile
+```
+
+The current container could not run this profile: `torch.cuda` reports no available GPUs, `nvidia-smi` cannot communicate with the driver, and the NCU invocation produced no report. No new latency or occupancy numbers are claimed here. The checked-in Nsight reports can be opened in Nsight Compute with `ncu-ui <report>.ncu-rep`; cite them only as historical 64-request captures.

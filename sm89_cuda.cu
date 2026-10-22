@@ -30,13 +30,13 @@
 #include <math.h>
 
 // ── Default Workload Parameters (Production Scaled Test) ─────────────────────
-#define DEFAULT_NUM_REQUESTS 64
+#define DEFAULT_NUM_REQUESTS 256
 #define DEFAULT_NUM_Q_HEADS  32
 #define DEFAULT_NUM_KV_HEADS 8
 #define DEFAULT_GROUP_SIZE   (DEFAULT_NUM_Q_HEADS / DEFAULT_NUM_KV_HEADS) // 4
 #define DEFAULT_HEAD_DIM     128
 #define DEFAULT_PAGE_SIZE    16
-#define DEFAULT_MAX_PAGES    512
+#define DEFAULT_MAX_PAGES    (DEFAULT_TOPK / DEFAULT_PAGE_SIZE)
 #define DEFAULT_TOPK         512
 #define DEFAULT_BLOCK_N      32
 

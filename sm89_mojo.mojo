@@ -14,15 +14,15 @@ from std.memory import Pointer
 # ---------------------------------------------------------------------------
 # Compile-time constants (exact match with CuTe DSL & Raw CUDA workload)
 # ---------------------------------------------------------------------------
-comptime NUM_REQUESTS = 64
+comptime NUM_REQUESTS = 256
 comptime NUM_Q_HEADS  = 32
 comptime NUM_KV_HEADS = 8
 comptime GROUP_SIZE   = 4
 comptime HEAD_DIM     = 128
 comptime PAGE_SIZE    = 16
-comptime MAX_PAGES    = 512
 comptime TOPK         = 512
-comptime BLOCK_N      = 16
+comptime MAX_PAGES    = TOPK // PAGE_SIZE
+comptime BLOCK_N      = 32
 comptime WARP_SIZE    = 32
 comptime NUM_WARPS    = GROUP_SIZE
 comptime THREADS      = WARP_SIZE * NUM_WARPS   # 128
@@ -129,6 +129,7 @@ def qsa_sm89_kernel(
             var vd2: Float32 = 0.0
             var vd3: Float32 = 0.0
 
+            var token_valid = false
             if active:
                 var ltok = Int(idx_ptr[unsafe_offset=row * (Int(topk) + 1) + col])
                 var lp   = ltok // PAGE_SIZE
@@ -137,6 +138,7 @@ def qsa_sm89_kernel(
 
                 var valid = (ltok >= 0) and (lp < Int(max_pages)) and (pb >= 0) and (pb < Int(nblocks))
                 if valid:
+                    token_valid = true
                     pb = max(0, min(pb, Int(nblocks) - 1))
                     var base = ((pb * PAGE_SIZE + po) * Int(nkv_heads) + kv_head) * HEAD_DIM + d0
                     var k_vec = k_ptr.unsafe_load[width=4](base)
@@ -164,11 +166,11 @@ def qsa_sm89_kernel(
             var alpha  = exp2(mx - new_mx)
             var p      = exp2(score - new_mx)
 
-            if not active:
+            if not token_valid:
                 alpha = 1.0
                 p     = 0.0
 
-            if active:
+            if token_valid:
                 mx = new_mx
 
             acc0 = acc0 * alpha + p * vd0
@@ -226,7 +228,7 @@ def main() raises:
     print("GPU   : " + ctx.name())
     print("SM    : sm_89\n")
 
-    print("[reference] running ...")
+    print("[Mojo / MAX] workload")
     print("  shape=(" + String(NUM_REQUESTS) + ", " + String(NUM_Q_HEADS) + ", " + String(HEAD_DIM) + "), dtype=torch.bfloat16\n")
 
     var nblocks = NUM_REQUESTS * MAX_PAGES
@@ -237,7 +239,7 @@ def main() raises:
     var t2r_size = NUM_REQUESTS
 
     print("[Mojo / MAX] compiling + warmup ...")
-    print("  VRAM allocated : 1084.6 MB   reserved: 3248.5 MB\n")
+    print("  K/V payload    : " + String(2 * kv_size) + " FP8 elements (" + String(Float64(2 * kv_size) / 1048576.0) + " MiB)\n")
 
     # Allocate GPU buffers
     var q_buf    = ctx.enqueue_create_buffer[DType.bfloat16](q_size)
@@ -296,9 +298,7 @@ def main() raises:
         )
     ctx.synchronize()
 
-    print("  max abs err : 0.000004")
-    print("  mean abs err: 0.000000")
-    print("  PASS (<1e-3): True\n")
+    print("  Reference check: unavailable (no reference comparison is implemented)\n")
 
     # Benchmark iterations
     var iters = 100
@@ -338,11 +338,10 @@ def main() raises:
     var avg_us_str = String(avg_us)[byte=0:6]
     var tflops_str = String(tflops)[byte=0:5]
 
-    print("  Kernel Latency: " + avg_ms_str + " ms/iter (" + avg_us_str + " us)")
-    print("  E2E Latency   : " + avg_ms_str + " ms/iter")
+    print("  Enqueue+sync wall time: " + avg_ms_str + " ms/iter (" + avg_us_str + " us)")
     print("  Throughput    : " + tflops_str + " TFLOP/s (compute)\n")
 
     print("=======================================================")
-    print("  SUMMARY  Mojo / MAX sparse GQA FP8 (64 reqs, TopK=512)")
-    print("  Kernel: " + avg_us_str + " us  |  " + tflops_str + " TFLOP/s  |  PASS=True")
+    print("  SUMMARY  Mojo / MAX sparse GQA FP8 (256 reqs, TopK=512)")
+    print("  Enqueue+sync: " + avg_us_str + " us  |  " + tflops_str + " TFLOP/s  |  validation=NOT CHECKED")
     print("=======================================================")

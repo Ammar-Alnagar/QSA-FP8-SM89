@@ -4,23 +4,14 @@ This repository contains synthetic sparse Grouped-Query Attention (GQA) benchmar
 
 ## Workload
 
-- 64 requests, 32 query heads, 8 KV heads, and head dimension 128
-- Top-K 512, page size 16, FP8 E4M3FN K/V cache
-- BF16 query, gate, and output tensors
+- 256 requests, 32 query heads, 8 KV heads, and head dimension 128
+- Top-K 512, page size 16, 32 physical pages per request
+- FP8 E4M3FN K/V cache; BF16 query, gate, and output tensors
 - Fused sigmoid gate and online softmax
 
-## Latest supplied results
+The grouped kernels launch 2,048 CTAs at this size (one per request/KV-head); the baseline launches 8,192 (one per request/query-head). The cache now holds exactly the pages needed for Top-K instead of allocating 512 pages per request. The old 64-request timing figures below describe a different workload and are not results for this configuration. A live profile could not be collected in the current environment because CUDA reports no available GPU.
 
-Measurements below are from the RTX 4060 Laptop run supplied on October 21, 2026. CuTe and CUDA kernel durations use CUDA events. Mojo uses host wall-clock timing around enqueue calls and a final synchronization, so it is not a pure GPU duration.
-
-| Implementation | Latency | Derived compute rate | Validation output |
-|---|---:|---:|---|
-| Baseline CuTe (`backup.py`) | 2.5078 ms | 0.214 TFLOP/s | PASS |
-| **Optimized CuTe (`sm89_cutedsl.py`)** | **0.7933 ms** | **0.677 TFLOP/s** | **PASS** |
-| Raw CUDA (`sm89_cuda.cu`) | 1.0042 ms | 0.535 TFLOP/s | PASS |
-| Mojo / MAX (`sm89_mojo.mojo`) | 2.5402 ms* | 0.211 TFLOP/s* | Prints PASS* |
-
-The optimized CuTe result is about 3.16× faster than the baseline in this run. The saved Nsight Compute reports are older and record 3.41 ms for baseline CuTe, 1.12 ms for optimized CuTe, and 1.00 ms for CUDA; these are kept separate from the latest run. The Mojo source currently prints hard-coded error/pass values rather than calculating a reference comparison.
+The source still contains prior 64-request measurements and saved Nsight Compute captures. See [`wrtiteup.md`](wrtiteup.md) for their provenance and the current profiling status. The Mojo source currently prints hard-coded error/pass values rather than calculating a reference comparison.
 
 ## Repository files
 

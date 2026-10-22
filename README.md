@@ -16,7 +16,7 @@ All six implementations report validation against either the shared PyTorch refe
 
 ## Current run
 
-Run `python3 run_all.py` for the six-implementation comparison, including the eager PyTorch baseline. In the recorded run, the measured order was Triton, raw CUDA, optimized CuTe, baseline CuTe, and PyTorch eager; Mojo is unranked because it reports enqueue-plus-sync wall time. The write-up includes measured rates, logical K/V payload estimates, and Nsight profiles with caveats in [`wrtiteup.md`](wrtiteup.md).
+Run `python3 run_all.py` for the six-implementation comparison, including the eager PyTorch baseline. In the recorded run, the measured order was raw CUDA, Triton, optimized CuTe, baseline CuTe, and PyTorch eager; Mojo is unranked because it reports enqueue-plus-sync wall time. The write-up includes measured rates, logical K/V payload estimates, and Nsight profiles with caveats in [`wrtiteup.md`](wrtiteup.md).
 
 ![Latency comparison including eager PyTorch and fused GPU implementations](charts/latency_comparison.png)
 

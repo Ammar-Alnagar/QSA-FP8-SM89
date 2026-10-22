@@ -63,24 +63,24 @@ The following run was collected with `python3 run_all.py` on the RTX 4060 Laptop
 
 | Speed rank | Implementation | Kernel / timed interval | E2E reported | Derived rate | Validation |
 |---:|---|---:|---:|---:|---|
-| 1 | Triton | 2.0830 ms | — | 1.031 TFLOP/s | max error 0.00000381, PASS |
-| 2 | Raw CUDA C++ | 2.7381 ms | 2.738 ms | 0.784 TFLOP/s | max error 0.00000000, PASS (fixture) |
-| 3 | Optimized CuTe DSL | 3.0718 ms | 27.703 ms | 0.699 TFLOP/s | max error 0.000004, PASS |
-| 4 | Baseline CuTe DSL | 15.5152 ms | 39.410 ms | 0.138 TFLOP/s | max error 0.00000, PASS |
-| 5 | PyTorch eager baseline | 27.8097 ms | 26.130 ms | 0.077 TFLOP/s* | max error 0.00000381, PASS |
-| — | Mojo / MAX | 13.533 ms enqueue+sync | — | 0.158 TFLOP/s† | max error 0.00004883, PASS (fixture) |
+| 1 | Raw CUDA C++ | 2.1641 ms | 2.164 ms | 0.992 TFLOP/s | PASS (fixture) |
+| 2 | Triton | 2.4420 ms | — | 0.879 TFLOP/s | PASS |
+| 3 | Optimized CuTe DSL | 4.4411 ms | 29.330 ms | 0.484 TFLOP/s | PASS |
+| 4 | Baseline CuTe DSL | 15.4536 ms | 38.795 ms | 0.139 TFLOP/s | PASS |
+| 5 | PyTorch eager baseline | 31.0188 ms | 27.032 ms | 0.069 TFLOP/s* | PASS |
+| — | Mojo / MAX | 12.985 ms enqueue+sync | — | 0.165 TFLOP/s† | PASS (fixture) |
 
 ![Latency comparison for PyTorch eager and the four fused CUDA-event kernels](charts/latency_comparison.png)
 
 ![Derived TFLOP/s comparison for the PyTorch eager baseline and fused kernels](charts/throughput_comparison.png)
 
-Triton had the lowest measured interval in this run. PyTorch eager uses the shared randomized input and reference; CUDA and Mojo passed their constant-fixture checks, which are narrower than the randomized reference comparison. The PyTorch event time spans many eager ATen operations, including gaps while Python dispatches them, so its speed rank is an implementation-level baseline rather than one fused-kernel comparison. Timings vary across runs; the table records one execution of the all-kernels command.
+Raw CUDA had the lowest measured interval in this run, ahead of Triton. PyTorch eager uses the shared randomized input and reference; CUDA and Mojo passed their constant-fixture checks, which are narrower than the randomized reference comparison. The PyTorch event time spans many eager ATen operations, including gaps while Python dispatches them, so its speed rank is an implementation-level baseline rather than one fused-kernel comparison. Timings vary across runs; the table records one execution of the all-kernels command. The comparison summary reports pass/fail and does not reprint per-element max error.
 
 `*` PyTorch eager's nominal rate uses CUDA-event elapsed time for its multi-operation sequence; its E2E column is the wall-clock average including dispatch and final synchronization. `†` Mojo's derived rate uses enqueue-plus-synchronization wall time, so it is not a GPU-only throughput. CUDA and Mojo fixture checks compare every output element with the analytically expected BF16(0.05) value.
 
 ### Speed order and data movement
 
-The measured order is **Triton → raw CUDA → optimized CuTe → baseline CuTe → PyTorch eager**. Their derived rates were **1.031 → 0.784 → 0.699 → 0.138 → 0.077 TFLOP/s**, respectively. Relative to optimized CuTe, this run measured Triton 1.65× faster and raw CUDA 1.12× faster; baseline CuTe was 5.05× slower. PyTorch eager took 27.8097 ms by CUDA events and 26.130 ms by wall time in this run. Its event interval measures an eager op sequence and is included as the framework baseline; the eager run peaked at 1,850 MiB allocated VRAM. Mojo remains unranked because its timing uses a different host-side method. These are one-run measurements, and timings vary across runs.
+The measured order is **raw CUDA → Triton → optimized CuTe → baseline CuTe → PyTorch eager**. Their derived rates were **0.992 → 0.879 → 0.484 → 0.139 → 0.069 TFLOP/s**, respectively. Relative to optimized CuTe, this run measured raw CUDA 2.05× faster and Triton 1.82× faster; baseline CuTe was 3.48× slower. Raw CUDA was 1.13× faster than Triton (`2.4420 / 2.1641`). PyTorch eager took 31.0188 ms by CUDA events and 27.032 ms by wall time in this run. Its event interval measures an eager op sequence and is included as the framework baseline. Mojo remains unranked because its timing uses a different host-side method. These are one-run measurements, and timings vary across runs.
 
 The K/V cache allocation is **256 MiB** (128 MiB each for K and V). Each query head's warp/program processes a 128 KiB K/V slice for its 512 selected tokens. The four fused custom kernels request about **1 GiB of logical K/V payload per invocation**: grouped kernels still issue per-warp K/V loads, and per-query-head kernels each load the corresponding rows. Grouping reduces CTA count from 8,192 to 2,048 but does not share these loads. The PyTorch eager baseline gathers each selected K/V row once per KV head and reuses that gathered tensor across the four query heads, for about **256 MiB of logical K/V payload**, with much larger temporary FP32 tensors. These are logical requested bytes, not measured DRAM bytes; cache reuse can reduce physical traffic. Q and output each occupy about 2 MiB, while gate and index/block-table metadata are smaller.
 

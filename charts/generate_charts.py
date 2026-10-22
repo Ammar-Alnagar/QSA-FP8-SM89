@@ -11,10 +11,10 @@ import numpy as np
 
 
 OUT = Path(__file__).parent
-NAMES = ["Triton", "Raw CUDA C++", "Optimized CuTe DSL", "Baseline CuTe DSL", "PyTorch eager baseline"]
-LATENCY_MS = [2.0830, 2.7381, 3.0718, 15.5152, 27.8097]
-TFLOPS = [1.031, 0.784, 0.699, 0.138, 0.077]
-COLORS = ["#6554C0", "#167D9A", "#2E8B57", "#D97706", "#667085"]
+NAMES = ["Raw CUDA C++", "Triton", "Optimized CuTe DSL", "Baseline CuTe DSL", "PyTorch eager baseline"]
+LATENCY_MS = [2.1641, 2.4420, 4.4411, 15.4536, 31.0188]
+TFLOPS = [0.992, 0.879, 0.484, 0.139, 0.069]
+COLORS = ["#167D9A", "#6554C0", "#2E8B57", "#D97706", "#667085"]
 
 PROFILE_NAMES = ["Optimized CuTe", "Baseline CuTe", "Raw CUDA", "Mojo / MAX", "Triton"]
 OCCUPANCY = [95.15, 98.86, 94.98, 94.01, 57.81]
@@ -36,8 +36,8 @@ def latency_chart():
     bars = ax.barh(y, LATENCY_MS, color=COLORS, height=0.58, edgecolor="none")
     ax.invert_yaxis()
     ax.set_yticks(y, NAMES, fontsize=11)
-    ax.set_xlim(0, 33)
-    ax.set_xticks(range(0, 34, 5))
+    ax.set_xlim(0, 46)
+    ax.set_xticks(range(0, 47, 5))
     ax.set_xlabel("CUDA-event kernel latency (ms)", fontsize=11, labelpad=9)
     ax.set_title("Sparse GQA FP8 implementation latency", loc="left", fontsize=16, weight="bold", pad=16, color="#182230")
     ax.text(0, 1.015, "RTX 4060 Laptop GPU · 256 requests · Top-K 512", transform=ax.transAxes, fontsize=10, color="#526174")

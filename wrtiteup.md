@@ -8,16 +8,16 @@
 
 **Current test workload:** 256 requests, 32 query heads, 8 KV heads, head dimension 128, Top-K 512, BF16 query/gate/output, FP8 E4M3FN K/V cache, page size 16, and 32 pages per request.
 
-This report describes the implementations and the larger test shape now configured in the sources. The current environment has no visible CUDA GPU (`torch.cuda` reports no available devices and `nvidia-smi` cannot reach the driver), so no latency or Nsight Compute numbers have been measured for the new shape. The figures below are retained only as historical results from the old 64-request shape; they must not be used as measurements for the current workload.
+This report describes the implementations and the larger test shape now configured in the sources. A focused Nsight Compute capture was collected on the RTX 4060 Laptop GPU for the optimized CuTe kernel at the 256-request shape. The NCU duration is profiler-instrumented and is not a normal benchmark latency. No new baseline, CUDA, or Mojo profiles have been collected at this shape. The older timing figures below are retained only as historical results from the 64-request shape.
 
 ## Implementations
 
 - [`sm89_cutedsl.py`](sm89_cutedsl.py): optimized CuTe DSL implementation. One 128-thread CTA handles one request and one KV head; each warp handles one of the four query heads sharing that KV head.
 - [`backup.py`](backup.py): CuTe DSL comparison kernel. One CTA handles one request and one query head, and its four warps cooperate on a 128-element dot product using shared memory and block barriers.
 - [`sm89_cuda.cu`](sm89_cuda.cu): standalone CUDA C++ implementation with the same request/KV-head CTA mapping as optimized CuTe. It uses inline PTX for FP8-to-FP16 conversion and CUDA warp shuffles.
-- [`sm89_mojo.mojo`](sm89_mojo.mojo): MAX GPU implementation with the same request/KV-head CTA mapping. It uses a 16-token loop tile; the other three implementations use 32.
+- [`sm89_mojo.mojo`](sm89_mojo.mojo): MAX GPU implementation with the same request/KV-head CTA mapping. Its loop tile is now 32 tokens, matching the other implementations. The source masks invalid tokens out of the online-softmax denominator and no longer reports hard-coded correctness values.
 
-All four implement the same intended operation for valid inputs: sparse scaled dot-product attention over the selected logical token indices, followed by a sigmoid gate. The Python implementations and CUDA implementation construct randomized BF16/FP8 tensors and compare their outputs to a PyTorch reference. The current Mojo script instead fills buffers with constants and prints hard-coded error/pass values; its printed `PASS` is not an independently computed comparison to a reference.
+All four implement the same intended operation for valid inputs: sparse scaled dot-product attention over the selected logical token indices, followed by a sigmoid gate. The two CuTe scripts construct randomized BF16/FP8 tensors and compare their outputs to a PyTorch reference. The CUDA and Mojo paths currently use constant-filled data and do not calculate a reference comparison; both now label validation as not checked.
 
 ## Workload and math
 
@@ -33,7 +33,7 @@ For request `r`, query head `h`, and its KV head `g = floor(h / 4)`, the kernel 
 
 The optimized CuTe and CUDA kernels fold `k_scale / sqrt(D) × log2(e)` into the score scale so that softmax exponentials use base 2. They accumulate unscaled V values and apply `v_scale` once in the final normalization. The baseline multiplies `v_scale` into each loaded V value. These transformations are algebraically equivalent for finite inputs, subject to floating-point rounding.
 
-The nominal operation count used by the scripts is `4 × B × TopK × Hq × D = 536,870,912` FLOPs: multiply-add work for QK and probability-weighted V. The reported TFLOP/s values use this convention; they are a derived rate, not a hardware counter.
+The nominal operation count used by the scripts is `4 × B × TopK × Hq × D` FLOPs: multiply-add work for QK and probability-weighted V. This is 2,147,483,648 FLOPs for the current 256-request shape and 536,870,912 FLOPs for the historical 64-request shape. TFLOP/s values use this convention and are derived rates, not hardware counters.
 
 ## Kernel organization in the source
 
@@ -49,28 +49,34 @@ The baseline launch grid is `[256, 32, 1]`, with one CTA per query head. The fou
 
 ### Mojo / MAX
 
-Mojo also launches `[256, 8, 1]` with 128 threads per CTA and maps a warp to a query head. Its source uses `BLOCK_N = 16`, `unsafe_load[width=4]` for vector elements, and a compile-time five-step shuffle reduction. The benchmark uses `perf_counter_ns` around 100 enqueues followed by `ctx.synchronize()`, so its reported latency includes host/runtime enqueue cost as well as GPU execution. It is not directly comparable to the CUDA-event kernel timings as a pure device duration.
+Mojo also launches `[256, 8, 1]` with 128 threads per CTA and maps a warp to a query head. Its source uses `BLOCK_N = 32`, `unsafe_load[width=4]` for vector elements, and a compile-time five-step shuffle reduction. Invalid indices are skipped in the online-softmax state. The benchmark uses `perf_counter_ns` around 100 enqueues followed by `ctx.synchronize()`, so its reported interval includes host/runtime enqueue cost as well as GPU execution. It is labeled enqueue-plus-sync wall time and is not directly comparable to CUDA-event kernel timing. Mojo still has no reference comparison, so its output is marked not checked.
 
 ## Historical 64-request benchmark run
 
-The following values are transcribed from the earlier 64-request run. They do not measure the current 256-request configuration. CuTe and CUDA report CUDA-event kernel timing; their E2E columns are the scripts' separate end-to-end measurements. Mojo's timing is host wall-clock time around enqueueing and synchronization, despite the printed `Kernel Latency` label.
+The following values are transcribed from the earlier 64-request run. They do not measure the current 256-request configuration. CuTe and CUDA report CUDA-event kernel timing; their E2E columns are the scripts' separate end-to-end measurements. The old Mojo timing is host wall-clock time around enqueueing and synchronization.
 
 | Implementation | Kernel / timed interval | E2E reported | Derived throughput | Printed validation |
 |---|---:|---:|---:|---|
 | Optimized CuTe DSL | 0.7933 ms (793.3 µs) | 59.512 ms | 0.677 TFLOP/s | max error 0.000004, PASS |
 | Baseline CuTe DSL | 2.5078 ms (2507.8 µs) | 61.272 ms | 0.214 TFLOP/s | max error 0.00000, PASS |
 | Raw CUDA C++ | 1.0042 ms (1004.2 µs) | 1.004 ms | 0.535 TFLOP/s | max error 0.000004, PASS |
-| Mojo / MAX | 2.5402 ms (2540.2 µs) | 2.5402 ms | 0.211 TFLOP/s | printed max error 0.000004, PASS* |
+| Mojo / MAX | 2.5402 ms (2540.2 µs) | 2.5402 ms | 0.211 TFLOP/s | old source printed PASS (not verified)* |
 
-`*` The Mojo source currently prints these validation numbers rather than calculating them. Its timing also includes runtime enqueue overhead, so the table does not support a direct pure-kernel speed ranking for Mojo.
+`*` The historical Mojo source printed validation values without calculating them. The current source marks validation as not checked. Its timing includes runtime enqueue overhead, so the table does not support a direct pure-kernel speed ranking for Mojo.
 
 For that old shape, optimized CuTe was about **3.16× faster** than the baseline (`2.5078 / 0.7933`). Raw CUDA was about **2.50× faster** than baseline and about **1.27× slower** than optimized CuTe in that run. These ratios do not establish performance at 256 requests.
 
-The supplied `nvidia-smi` snapshot reports driver 595.91.07, CUDA 13.2, GPU memory capacity 8,188 MiB, and 76 MiB in use after the scripts exited. This is a post-run idle snapshot, not a measurement of each process's peak allocation. The scripts print 1,084.6 MB allocated and 3,248.5 MB reserved during their run.
+The historical `nvidia-smi` snapshot reported driver 595.91.07, CUDA 13.2, GPU memory capacity 8,188 MiB, and 76 MiB in use after those scripts exited. This was a post-run idle snapshot, not a measurement of each process's peak allocation.
 
-## Saved Nsight Compute captures
+## Current Nsight Compute profile
 
-The three `.ncu-rep` files in the repository are older captures of the 64-request shape. Reading their recorded metrics with Nsight Compute gives:
+The optimized CuTe kernel was captured on October 22, 2026 with Nsight Compute 2026.1.1, using the `basic` set and filtering on `qsa_sm89_kernel`. The report is [`qsa_sm89_cutedsl_256.ncu-rep`](qsa_sm89_cutedsl_256.ncu-rep). It records grid `(256, 8, 1)` (2,048 CTAs), block size 128, 24 SMs, 38 registers/thread, and 7.11 waves/SM. NCU reports 100% theoretical occupancy and 95.15% achieved occupancy (45.67 active warps/SM). This confirms that the larger test supplies enough work to keep the GPU highly occupied for this kernel.
+
+NCU reports 4.01 ms duration for the profiled launch, 75.2% compute throughput, 69.2% memory throughput, and 27.2% DRAM throughput. Treat the duration as profiler-instrumented; NCU replays the kernel to collect counters, so it is not comparable to CUDA-event timing outside the profiler. The values establish occupancy for optimized CuTe only; they do not establish a performance speedup over the old shape or explain a bottleneck by themselves.
+
+## Historical saved Nsight Compute captures
+
+The three original `.ncu-rep` files in the repository are older captures of the 64-request shape. Reading their recorded metrics with Nsight Compute gives:
 
 | Capture | Grid | Duration | L1/TEX hit rate | Registers/thread | Dynamic shared memory/block |
 |---|---:|---:|---:|---:|---:|
@@ -84,8 +90,8 @@ The older values previously presented as Mojo NCU metrics, including estimated h
 
 ## Benchmark interpretation and limits
 
-- The CuTe event times are the closest pure-device measurements in the supplied log. The separately reported CuTe E2E times are much larger, indicating substantial host/runtime work in that path; they should not be conflated with kernel execution time.
-- CUDA's E2E value in this run matches its kernel value at the displayed precision. This does not mean the other scripts measure the same timing interval.
+- In the historical run, the CuTe event times are the closest pure-device measurements in the supplied log. The separately reported CuTe E2E times are much larger, indicating substantial host/runtime work in that path; they should not be conflated with kernel execution time.
+- CUDA's E2E value in that historical run matches its kernel value at the displayed precision. This does not mean the other scripts measure the same timing interval.
 - Mojo's wall-clock interval includes repeated `enqueue_function` submissions and a final synchronization. A CUDA-event or Nsight capture would be needed to report its isolated GPU duration.
 - The scripts use synthetic data and a fixed Top-K selection. They demonstrate this workload and implementation, not end-to-end model serving performance or an adaptive QSA selection strategy.
 - The displayed latency and derived throughput are measurements from the supplied run and hardware/software state; they are not guaranteed results on another machine or run.
@@ -105,4 +111,12 @@ Profile the optimized CuTe kernel after the GPU is visible to the process:
 ncu --set basic --target-processes all .venv/bin/python sm89_cutedsl.py --profile
 ```
 
-The current container could not run this profile: `torch.cuda` reports no available GPUs, `nvidia-smi` cannot communicate with the driver, and the NCU invocation produced no report. No new latency or occupancy numbers are claimed here. The checked-in Nsight reports can be opened in Nsight Compute with `ncu-ui <report>.ncu-rep`; cite them only as historical 64-request captures.
+Recreate the focused CuTe capture with:
+
+```bash
+ncu --set basic --kernel-name-base function --kernel-name regex:qsa_sm89_kernel \
+  --target-processes all --export qsa_sm89_cutedsl_256 \
+  .venv/bin/python sm89_cutedsl.py --profile
+```
+
+Open either current or historical reports in Nsight Compute with `ncu-ui <report>.ncu-rep`. Only the new filtered report measures the 256-request optimized CuTe kernel; the other checked-in reports are historical 64-request captures.

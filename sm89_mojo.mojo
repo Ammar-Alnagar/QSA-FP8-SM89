@@ -129,7 +129,7 @@ def qsa_sm89_kernel(
             var vd2: Float32 = 0.0
             var vd3: Float32 = 0.0
 
-            var token_valid = false
+            var token_valid = False
             if active:
                 var ltok = Int(idx_ptr[unsafe_offset=row * (Int(topk) + 1) + col])
                 var lp   = ltok // PAGE_SIZE
@@ -138,7 +138,7 @@ def qsa_sm89_kernel(
 
                 var valid = (ltok >= 0) and (lp < Int(max_pages)) and (pb >= 0) and (pb < Int(nblocks))
                 if valid:
-                    token_valid = true
+                    token_valid = True
                     pb = max(0, min(pb, Int(nblocks) - 1))
                     var base = ((pb * PAGE_SIZE + po) * Int(nkv_heads) + kv_head) * HEAD_DIM + d0
                     var k_vec = k_ptr.unsafe_load[width=4](base)

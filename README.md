@@ -9,9 +9,9 @@ This repository contains synthetic sparse Grouped-Query Attention (GQA) benchmar
 - FP8 E4M3FN K/V cache; BF16 query, gate, and output tensors
 - Fused sigmoid gate and online softmax
 
-The grouped kernels launch 2,048 CTAs at this size (one per request/KV-head); the baseline launches 8,192 (one per request/query-head). The cache now holds exactly the pages needed for Top-K instead of allocating 512 pages per request. The old 64-request timing figures below describe a different workload and are not results for this configuration. A live profile could not be collected in the current environment because CUDA reports no available GPU.
+The grouped kernels launch 2,048 CTAs at this size (one per request/KV-head); the baseline launches 8,192 (one per request/query-head). The cache now holds exactly the pages needed for Top-K instead of allocating 512 pages per request. An Nsight Compute profile of optimized CuTe measured 95.15% achieved occupancy at this shape; old 64-request timing figures do not describe this configuration.
 
-The source still contains prior 64-request measurements and saved Nsight Compute captures. See [`wrtiteup.md`](wrtiteup.md) for their provenance and the current profiling status. The Mojo source currently prints hard-coded error/pass values rather than calculating a reference comparison.
+The source still contains prior 64-request measurements and saved Nsight Compute captures. See [`wrtiteup.md`](wrtiteup.md) for their provenance and the current profiling status. CuTe performs a reference comparison; CUDA and Mojo report validation as not checked because those paths do not calculate a reference comparison.
 
 ## Repository files
 
@@ -20,6 +20,7 @@ The source still contains prior 64-request measurements and saved Nsight Compute
 - `sm89_cuda.cu` — CUDA C++ implementation
 - `sm89_mojo.mojo` — Mojo / MAX implementation
 - `qsa_sm89_*.ncu-rep` — saved Nsight Compute captures for baseline CuTe, optimized CuTe, and CUDA
+- `qsa_sm89_cutedsl_256.ncu-rep` — focused Nsight Compute profile for optimized CuTe at the current 256-request shape
 - [`wrtiteup.md`](wrtiteup.md) — implementation details, profiling notes, and measurement caveats
 
 ## Run

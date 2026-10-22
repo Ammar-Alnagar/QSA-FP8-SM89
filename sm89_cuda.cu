@@ -269,8 +269,20 @@ extern "C" void launch_qsa_cuda(
 // ── Standalone Benchmark Main ────────────────────────────────────────────────
 #ifndef NO_MAIN
 int main() {
+    int device_count = 0;
+    cudaError_t device_status = cudaGetDeviceCount(&device_count);
+    if (device_status != cudaSuccess || device_count == 0) {
+        fprintf(stderr, "CUDA device unavailable: %s\n",
+                device_status == cudaSuccess ? "no CUDA devices found" : cudaGetErrorString(device_status));
+        return 2;
+    }
+
     cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 0);
+    cudaError_t prop_status = cudaGetDeviceProperties(&prop, 0);
+    if (prop_status != cudaSuccess) {
+        fprintf(stderr, "cudaGetDeviceProperties failed: %s\n", cudaGetErrorString(prop_status));
+        return 2;
+    }
     printf("GPU   : %s\n", prop.name);
     printf("SM    : sm_%d%d\n\n", prop.major, prop.minor);
 
@@ -324,7 +336,7 @@ int main() {
     float softmax_scale = (1.0f / sqrtf((float)DEFAULT_HEAD_DIM)) * k_scale * log2e;
 
     printf("[Raw CUDA C++] compiling + warmup ...\n");
-    printf("  VRAM allocated : 1084.6 MB   reserved: 3248.5 MB\n\n");
+    printf("  K/V payload    : %zu MiB total\n\n", (2 * kv_size) / (1024 * 1024));
 
     // Warmup
     for (int i = 0; i < 10; i++) {
@@ -338,12 +350,7 @@ int main() {
     }
     cudaDeviceSynchronize();
 
-    float max_err = 0.000004f;
-    float mean_err = 0.000000f;
-    bool passed = true;
-    printf("  max abs err : %.6f\n", max_err);
-    printf("  mean abs err: %.6f\n", mean_err);
-    printf("  PASS (<1e-3): %s\n", passed ? "True" : "False");
+    printf("  Reference check: unavailable (no reference comparison is implemented)\n");
 
     // Benchmark
     int iters = 100;
@@ -377,8 +384,8 @@ int main() {
     printf("=======================================================\n");
     printf("  SUMMARY  Raw CUDA C++ sparse GQA FP8 (%d reqs, TopK=%d)\n",
            DEFAULT_NUM_REQUESTS, DEFAULT_TOPK);
-    printf("  Kernel: %.1f us  |  %.2f TFLOP/s  |  PASS=%s\n",
-           avg_ms * 1000.0f, tflops, passed ? "True" : "False");
+    printf("  Kernel: %.1f us  |  %.2f TFLOP/s  |  validation=NOT CHECKED\n",
+           avg_ms * 1000.0f, tflops);
     printf("=======================================================\n");
 
     cudaFree(d_q); cudaFree(d_gate); cudaFree(d_out);

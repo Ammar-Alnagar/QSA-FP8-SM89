@@ -79,7 +79,7 @@ def show_table(rows: list[tuple[str, dict[str, str]]]) -> None:
     print("-+-".join("-" * width for width in widths))
     for row in values:
         print(" | ".join(row[i].ljust(widths[i]) for i in range(len(columns))))
-    print("\nCUDA-event times are device timings. Mojo's time includes host enqueue and synchronization.")
+    print("\nPyTorch's event time spans its eager operator sequence; CUDA/CuTe/Triton event times cover the fused kernel. Mojo includes host enqueue and synchronization.")
 
 
 def main() -> int:

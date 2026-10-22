@@ -10,17 +10,19 @@ This repository contains synthetic sparse Grouped-Query Attention (GQA) benchmar
 - Fused sigmoid gate and online softmax
 - PyTorch reference environment: 2.14.1+cu130 (CUDA 13.0 build)
 
-Grouped kernels launch 2,048 CTAs at this size (one per request/KV-head); baseline CuTe and Triton launch 8,192 (one per request/query-head). All five mappings request about 1 GiB of logical K/V payload: grouped CTAs still issue separate K/V loads from each query-head warp. The cache holds exactly the pages needed for Top-K. Current Nsight Compute captures report 57.81–98.86% achieved occupancy across the five kernels; old 64-request timing figures do not describe this configuration.
+Grouped kernels launch 2,048 CTAs at this size (one per request/KV-head); baseline CuTe and Triton launch 8,192 (one per request/query-head). The four fused GPU implementations request about 1 GiB of logical K/V payload per invocation; the eager PyTorch baseline gathers about 256 MiB and reuses it across query heads. The cache holds exactly the pages needed for Top-K. Current Nsight Compute captures report 57.81–98.86% achieved occupancy across the five fused GPU kernels; old 64-request timing figures do not describe this configuration.
 
-All five implementations report validation against either the shared PyTorch reference or an independent closed-form constant-input reference. The source also contains prior 64-request measurements and saved Nsight Compute captures. See [`wrtiteup.md`](wrtiteup.md) for their provenance and the current profiling status.
+All six implementations report validation against either the shared PyTorch reference or an independent closed-form constant-input reference. The PyTorch eager baseline, CuTe, and Triton use randomized data; CUDA and Mojo use a constant-input check. The source also contains prior 64-request measurements and saved Nsight Compute captures. See [`wrtiteup.md`](wrtiteup.md) for their provenance and profiling details.
 
 ## Current run
 
-Run `python3 run_all.py` for the current five-kernel comparison table. In the recorded run, CUDA-event speed order was Triton, raw CUDA, optimized CuTe, then baseline CuTe. CuTe and Triton use the shared randomized PyTorch reference; CUDA and Mojo use a constant-input closed-form check. Mojo timing includes enqueue plus synchronization, so it is not ranked against device-event timings. The write-up includes measured rates, logical K/V payload estimates, and the matching Nsight profiles with caveats in [`wrtiteup.md`](wrtiteup.md).
+Run `python3 run_all.py` for the six-implementation comparison, including the eager PyTorch baseline. In the recorded run, the measured order was Triton, raw CUDA, optimized CuTe, baseline CuTe, and PyTorch eager; Mojo is unranked because it reports enqueue-plus-sync wall time. The write-up includes measured rates, logical K/V payload estimates, and Nsight profiles with caveats in [`wrtiteup.md`](wrtiteup.md).
 
-![CUDA-event kernel latency comparison](charts/latency_comparison.png)
+![Latency comparison including eager PyTorch and fused GPU implementations](charts/latency_comparison.png)
 
-The write-up also includes a [CTA mapping and logical K/V movement diagram](charts/kv_data_movement.png).
+![Derived TFLOP/s comparison](charts/throughput_comparison.png)
+
+The write-up also includes a [K/V movement diagram](charts/kv_data_movement.png) and [Nsight Compute counter chart](charts/ncu_utilization.png).
 
 ## Repository files
 
@@ -28,10 +30,12 @@ The write-up also includes a [CTA mapping and logical K/V movement diagram](char
 - `backup.py` — baseline CuTe kernel, one CTA per request/query head
 - `sm89_cuda.cu` — CUDA C++ implementation
 - `sm89_mojo.mojo` — Mojo / MAX implementation
+- `sm89_torch.py` — vectorized eager PyTorch baseline
 - `sm89_triton.py` — Triton implementation with PyTorch reference validation
-- `run_all.py` — runs all five implementations and prints a comparison table
+- `charts/generate_charts.py` — regenerates the comparison figures from the reported run
+- `run_all.py` — runs all six implementations and prints a comparison table
 - `qsa_sm89_*.ncu-rep` — saved Nsight Compute captures for the original CuTe/CUDA implementations
-- `qsa_sm89_*_256.ncu-rep` — focused Nsight Compute profiles for all five kernels at the current 256-request shape
+- `qsa_sm89_*_256.ncu-rep` — focused Nsight Compute profiles for the fused GPU kernels at the current 256-request shape
 - [`wrtiteup.md`](wrtiteup.md) — implementation details, profiling notes, and measurement caveats
 
 ## Run

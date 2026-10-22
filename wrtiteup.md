@@ -8,17 +8,18 @@
 
 **Current test workload:** 256 requests, 32 query heads, 8 KV heads, head dimension 128, Top-K 512, BF16 query/gate/output, FP8 E4M3FN K/V cache, page size 16, and 32 pages per request.
 
-This report describes the implementations and the larger test shape now configured in the sources. Focused Nsight Compute captures were collected on the RTX 4060 Laptop GPU for all five kernels at the 256-request shape. NCU durations are profiler-instrumented and are not normal benchmark latencies. The older timing figures below are retained only as historical results from the 64-request shape.
+This report describes the implementations and the larger test shape now configured in the sources. Focused Nsight Compute captures were collected on the RTX 4060 Laptop GPU for the five fused GPU kernels at the 256-request shape. The eager PyTorch baseline is a sequence of framework operations, not one kernel. NCU durations are profiler-instrumented and are not normal benchmark latencies. The older timing figures below are retained only as historical results from the 64-request shape.
 
 ## Implementations
 
 - [`sm89_cutedsl.py`](sm89_cutedsl.py): optimized CuTe DSL implementation. One 128-thread CTA handles one request and one KV head; each warp handles one of the four query heads sharing that KV head.
 - [`backup.py`](backup.py): CuTe DSL comparison kernel. One CTA handles one request and one query head, and its four warps cooperate on a 128-element dot product using shared memory and block barriers.
+- [`sm89_torch.py`](sm89_torch.py): vectorized eager PyTorch baseline. It gathers each selected K/V row once per KV head, then uses batched matmul, softmax, and gating operations.
 - [`sm89_triton.py`](sm89_triton.py): Triton implementation, one program per request/query head, with a 32-token loop tile and online softmax.
 - [`sm89_cuda.cu`](sm89_cuda.cu): standalone CUDA C++ implementation with the same request/KV-head CTA mapping as optimized CuTe. It uses inline PTX for FP8-to-FP16 conversion and CUDA warp shuffles.
 - [`sm89_mojo.mojo`](sm89_mojo.mojo): MAX GPU implementation with the same request/KV-head CTA mapping. Its loop tile is now 32 tokens, matching the other implementations. The source masks invalid tokens out of the online-softmax denominator and no longer reports hard-coded correctness values.
 
-All five implement the same intended operation for valid inputs: sparse scaled dot-product attention over selected logical token indices, followed by a sigmoid gate. The CuTe and Triton scripts use the same randomized BF16/FP8 inputs and compare against the shared PyTorch reference. CUDA and Mojo use constant fixtures and check every output against the closed-form BF16(0.05) result; these checks exercise the output path but do not cover randomized inputs.
+All six implementations compute the same intended operation for valid inputs: sparse scaled dot-product attention over selected logical token indices, followed by a sigmoid gate. The PyTorch eager baseline, CuTe, and Triton use the same randomized BF16/FP8 inputs and compare against the shared reference. CUDA and Mojo use constant fixtures and check every output against the closed-form BF16(0.05) result; these checks exercise the output path but do not cover randomized inputs.
 
 ## Workload and math
 
@@ -58,31 +59,36 @@ Mojo also launches `[256, 8, 1]` with 128 threads per CTA and maps a warp to a q
 
 ## Current 256-request benchmark run
 
-The following run was collected with `python3 run_all.py` on the RTX 4060 Laptop GPU. CuTe, Triton, and CUDA use CUDA events; Mojo reports host wall time around enqueueing and synchronization. The E2E columns are the values printed by each script and do not represent a common timing interval.
+The following run was collected with `python3 run_all.py` on the RTX 4060 Laptop GPU. Fused CuTe, Triton, and CUDA kernels use CUDA events. PyTorch eager timing measures its sequence of PyTorch operations with CUDA events; its wall-clock E2E value also includes framework dispatch. Mojo reports host wall time around enqueueing and synchronization. The E2E columns do not represent a common timing interval.
 
 | Speed rank | Implementation | Kernel / timed interval | E2E reported | Derived rate | Validation |
 |---:|---|---:|---:|---:|---|
-| 1 | Triton | 2.5130 ms | — | 0.855 TFLOP/s | max error 0.00000381, PASS |
-| 2 | Raw CUDA C++ | 3.0692 ms | 3.069 ms | 0.700 TFLOP/s | max error 0.00000000, PASS† |
-| 3 | Optimized CuTe DSL | 4.2694 ms | 26.104 ms | 0.503 TFLOP/s | max error 0.000004, PASS |
-| 4 | Baseline CuTe DSL | 26.8541 ms | 41.601 ms | 0.080 TFLOP/s | max error 0.00000, PASS |
-| — | Mojo / MAX | 16.840 ms enqueue+sync | — | 0.127 TFLOP/s* | max error 0.00004883, PASS† |
+| 1 | Triton | 2.0830 ms | — | 1.031 TFLOP/s | max error 0.00000381, PASS |
+| 2 | Raw CUDA C++ | 2.7381 ms | 2.738 ms | 0.784 TFLOP/s | max error 0.00000000, PASS (fixture) |
+| 3 | Optimized CuTe DSL | 3.0718 ms | 27.703 ms | 0.699 TFLOP/s | max error 0.000004, PASS |
+| 4 | Baseline CuTe DSL | 15.5152 ms | 39.410 ms | 0.138 TFLOP/s | max error 0.00000, PASS |
+| 5 | PyTorch eager baseline | 27.8097 ms | 26.130 ms | 0.077 TFLOP/s* | max error 0.00000381, PASS |
+| — | Mojo / MAX | 13.533 ms enqueue+sync | — | 0.158 TFLOP/s† | max error 0.00004883, PASS (fixture) |
 
-![CUDA-event latency comparison for the four kernels with comparable device timing](charts/latency_comparison.png)
+![Latency comparison for PyTorch eager and the four fused CUDA-event kernels](charts/latency_comparison.png)
 
-In this run, Triton had the lowest CUDA-event latency. Its test uses the same randomized data and PyTorch reference as CuTe. CUDA and Mojo passed their constant-fixture checks, which are narrower than the randomized reference comparison. Timings vary across runs; the table records one execution of the all-kernels command.
+![Derived TFLOP/s comparison for the PyTorch eager baseline and fused kernels](charts/throughput_comparison.png)
 
-`*` Mojo's reported rate divides the nominal FLOP count by host enqueue-plus-synchronization time, so it is not a GPU-only throughput and should not be ranked with CUDA-event rates. `†` CUDA/Mojo checks compare all output elements to the analytically expected BF16(0.05) output for their constant fixtures.
+Triton had the lowest measured interval in this run. PyTorch eager uses the shared randomized input and reference; CUDA and Mojo passed their constant-fixture checks, which are narrower than the randomized reference comparison. The PyTorch event time spans many eager ATen operations, including gaps while Python dispatches them, so its speed rank is an implementation-level baseline rather than one fused-kernel comparison. Timings vary across runs; the table records one execution of the all-kernels command.
+
+`*` PyTorch eager's nominal rate uses CUDA-event elapsed time for its multi-operation sequence; its E2E column is the wall-clock average including dispatch and final synchronization. `†` Mojo's derived rate uses enqueue-plus-synchronization wall time, so it is not a GPU-only throughput. CUDA and Mojo fixture checks compare every output element with the analytically expected BF16(0.05) value.
 
 ### Speed order and data movement
 
-For comparable CUDA-event kernel times, the speed order is **Triton → raw CUDA → optimized CuTe → baseline CuTe**. The derived rate column follows the same order: **0.855 → 0.700 → 0.503 → 0.080 TFLOP/s**. Relative to optimized CuTe, this run measured Triton at 1.70× faster, raw CUDA at 1.39× faster, and baseline CuTe at 6.29× slower. These are single-run results; small timing changes can shift close rankings. Mojo is excluded because its enqueue-plus-sync wall interval includes host/runtime work.
+The measured order is **Triton → raw CUDA → optimized CuTe → baseline CuTe → PyTorch eager**. Their derived rates were **1.031 → 0.784 → 0.699 → 0.138 → 0.077 TFLOP/s**, respectively. Relative to optimized CuTe, this run measured Triton 1.65× faster and raw CUDA 1.12× faster; baseline CuTe was 5.05× slower. PyTorch eager took 27.8097 ms by CUDA events and 26.130 ms by wall time in this run. Its event interval measures an eager op sequence and is included as the framework baseline; the eager run peaked at 1,850 MiB allocated VRAM. Mojo remains unranked because its timing uses a different host-side method. These are one-run measurements, and timings vary across runs.
 
-The K/V cache allocation is **256 MiB** (128 MiB each for K and V). Each query head's warp/program processes a 128 KiB K/V slice for its 512 selected tokens. The grouped kernels place four query-head warps in one CTA, but each warp still issues its own K/V loads; therefore the grouped kernels, baseline CuTe, and Triton all request about **1 GiB of logical K/V payload per invocation**. Grouping reduces the CTA count from 8,192 to 2,048, but the current source does not share K/V loads across those four warps. These are logical requested bytes, not measured DRAM bytes; cache reuse can reduce physical traffic. Q and output each occupy about 2 MiB, while gate and index/block-table metadata are smaller.
+The K/V cache allocation is **256 MiB** (128 MiB each for K and V). Each query head's warp/program processes a 128 KiB K/V slice for its 512 selected tokens. The four fused custom kernels request about **1 GiB of logical K/V payload per invocation**: grouped kernels still issue per-warp K/V loads, and per-query-head kernels each load the corresponding rows. Grouping reduces CTA count from 8,192 to 2,048 but does not share these loads. The PyTorch eager baseline gathers each selected K/V row once per KV head and reuses that gathered tensor across the four query heads, for about **256 MiB of logical K/V payload**, with much larger temporary FP32 tensors. These are logical requested bytes, not measured DRAM bytes; cache reuse can reduce physical traffic. Q and output each occupy about 2 MiB, while gate and index/block-table metadata are smaller.
 
 ![Diagram comparing grouped and per-query-head CTA mappings and their logical K/V payload](charts/kv_data_movement.png)
 
-The RTX 4060 Laptop GPU has 24 SMs. All kernels launch enough CTAs for multiple waves, but their mapping and generated work differ. Triton leads this run despite requesting the same logical K/V volume: its Nsight capture reports 86.31% SM throughput and 41.35% DRAM throughput, with 72 registers/thread and 57.81% achieved occupancy. This indicates strong utilization for this implementation, but does not isolate a single cause; cache reuse means the 1 GiB logical request estimate does not imply 1 GiB from DRAM. Raw CUDA and optimized CuTe use the grouped mapping, reducing CTA count while still issuing duplicate warp-level K/V loads. CUDA measured faster here; its capture has 34 registers/thread and 94.80% occupancy versus CuTe's 38 registers and 95.15%, but these counters alone do not establish why. The baseline's per-query-head CTA mapping repeats K/V work and adds shared-memory cross-warp reduction and barriers; it is slowest in this run even though its achieved occupancy is high. Mojo has grouped mapping and similar occupancy, but its displayed host timing cannot support a GPU-kernel speed ranking.
+![Nsight Compute achieved occupancy and DRAM throughput counters](charts/ncu_utilization.png)
+
+The RTX 4060 Laptop GPU has 24 SMs. All fused kernels launch enough CTAs for multiple waves, but their mapping and generated work differ. Triton's capture reports 86.31% SM throughput and 41.35% DRAM throughput, with 72 registers/thread and 57.81% achieved occupancy. These counters indicate strong utilization for this implementation but do not isolate a single cause. Raw CUDA and optimized CuTe use the grouped mapping, reducing CTA count while still issuing duplicate warp-level K/V loads. The baseline's per-query-head CTA mapping adds shared-memory cross-warp reduction and barriers; it has high occupancy but lower measured throughput. The utilization chart compares these peak-relative profiler counters; it does not include the PyTorch eager sequence as a single kernel.
 
 ### Raw CUDA follow-up
 
@@ -107,17 +113,17 @@ The historical `nvidia-smi` snapshot reported driver 595.91.07, CUDA 13.2, GPU m
 
 ## Current Nsight Compute profiles
 
-All five kernels were captured with Nsight Compute and the `basic` metric set. The matching reports are checked in as `qsa_sm89_{cutedsl,baseline,raw_cuda,mojo,triton}_256.ncu-rep`. The workload and launch shapes were the same as in the timing table above.
+The five fused GPU kernels were captured with Nsight Compute and the `basic` metric set. The matching 256-request reports are checked in; `qsa_sm89_raw_cuda_final.ncu-rep` is the refreshed capture for the specialized CUDA kernel. The PyTorch eager baseline is an ATen operation sequence and is not represented as one kernel in this table.
 
 | Kernel | Grid CTAs | NCU duration* | Achieved occupancy | Registers/thread | Waves/SM | SM throughput | Memory throughput | DRAM throughput |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | Optimized CuTe | 2,048 | 4.013 ms | 95.15% | 38 | 7.11 | 75.19% | 69.20% | 27.23% |
 | Baseline CuTe | 8,192 | 13.725 ms | 98.86% | 40 | 28.44 | 70.13% | 70.13% | 15.46% |
-| Raw CUDA | 2,048 | 3.548 ms | 94.80% | 34 | 7.11 | 78.72% | 46.99% | 30.97% |
+| Raw CUDA (specialized) | 2,048 | 2.840 ms | 94.98% | 35 | 7.11 | 74.92% | 59.00% | 40.16% |
 | Mojo / MAX | 2,048 | 13.824 ms | 94.01% | 38 | 7.11 | 89.96% | 20.10% | 8.05% |
 | Triton | 8,192 | 2.651 ms | 57.81% | 72 | 48.76 | 86.31% | 86.31% | 41.35% |
 
-The device has 24 SMs and all five kernels launch enough blocks for multiple waves. Achieved occupancy ranges from 57.81% to 98.86%; occupancy alone does not predict latency. Triton has the lowest reported occupancy but the highest CUDA-event rate in this run, while grouped kernels reduce logical K/V requests. Cache behavior, instruction mix, reduction strategy, and launch overhead also affect results.
+The device has 24 SMs and all five fused kernels launch enough blocks for multiple waves. Achieved occupancy ranges from 57.81% to 98.86%; occupancy alone does not predict latency. The PyTorch eager sequence is not represented as one Nsight kernel row. Cache behavior, instruction mix, reduction strategy, and launch overhead also affect results.
 
 `*` NCU replays launches while collecting metrics; these instrumented durations are not directly comparable to the CUDA-event timings in the benchmark table. Throughput percentages are NCU's peak-relative counters, not percentages of application-level useful work.
 
@@ -145,7 +151,7 @@ The older values previously presented as Mojo NCU metrics, including estimated h
 
 ## Reproduction commands
 
-Run all five implementations and print their comparison table:
+Run all six implementations and print their comparison table:
 
 ```bash
 python3 run_all.py
@@ -156,6 +162,7 @@ Run individual implementations if needed:
 ```bash
 python3 sm89_cutedsl.py
 python3 backup.py
+python3 sm89_torch.py
 cudarun sm89_cuda.cu
 mojo sm89_mojo.mojo
 ```
@@ -168,4 +175,4 @@ ncu --set basic --kernel-name-base function --kernel-name regex:qsa_sm89_kernel 
   .venv/bin/python sm89_cutedsl.py --profile
 ```
 
-The current filtered captures are `qsa_sm89_baseline_256.ncu-rep`, `qsa_sm89_raw_cuda_256.ncu-rep`, `qsa_sm89_mojo_256.ncu-rep`, and `qsa_sm89_triton_256.ncu-rep`. Open current or historical reports in Nsight Compute with `ncu-ui <report>.ncu-rep`. The three original reports are historical 64-request captures.
+The current filtered captures include `qsa_sm89_baseline_256.ncu-rep`, `qsa_sm89_raw_cuda_final.ncu-rep`, `qsa_sm89_mojo_256.ncu-rep`, and `qsa_sm89_triton_256.ncu-rep`. Open current or historical reports in Nsight Compute with `ncu-ui <report>.ncu-rep`. The three original reports are historical 64-request captures.

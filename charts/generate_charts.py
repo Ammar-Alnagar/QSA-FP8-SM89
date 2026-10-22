@@ -11,10 +11,10 @@ import numpy as np
 
 
 OUT = Path(__file__).parent
-NAMES = ["Triton", "Raw CUDA C++", "Optimized CuTe DSL", "Baseline CuTe DSL"]
-LATENCY_MS = [2.6649, 2.7700, 4.3892, 11.9214]
-TFLOPS = [0.806, 0.775, 0.489, 0.180]
-COLORS = ["#6554C0", "#167D9A", "#2E8B57", "#D97706"]
+NAMES = ["Triton", "Raw CUDA C++", "Optimized CuTe DSL", "Baseline CuTe DSL", "PyTorch eager baseline"]
+LATENCY_MS = [2.0830, 2.7381, 3.0718, 15.5152, 27.8097]
+TFLOPS = [1.031, 0.784, 0.699, 0.138, 0.077]
+COLORS = ["#6554C0", "#167D9A", "#2E8B57", "#D97706", "#667085"]
 
 PROFILE_NAMES = ["Optimized CuTe", "Baseline CuTe", "Raw CUDA", "Mojo / MAX", "Triton"]
 OCCUPANCY = [95.15, 98.86, 94.98, 94.01, 57.81]
@@ -36,10 +36,10 @@ def latency_chart():
     bars = ax.barh(y, LATENCY_MS, color=COLORS, height=0.58, edgecolor="none")
     ax.invert_yaxis()
     ax.set_yticks(y, NAMES, fontsize=11)
-    ax.set_xlim(0, 14)
-    ax.set_xticks(range(0, 15, 2))
+    ax.set_xlim(0, 33)
+    ax.set_xticks(range(0, 34, 5))
     ax.set_xlabel("CUDA-event kernel latency (ms)", fontsize=11, labelpad=9)
-    ax.set_title("Sparse GQA FP8 kernel latency", loc="left", fontsize=16, weight="bold", pad=16, color="#182230")
+    ax.set_title("Sparse GQA FP8 implementation latency", loc="left", fontsize=16, weight="bold", pad=16, color="#182230")
     ax.text(0, 1.015, "RTX 4060 Laptop GPU · 256 requests · Top-K 512", transform=ax.transAxes, fontsize=10, color="#526174")
     ax.grid(axis="x", color="#DCE2EA", linewidth=0.8)
     ax.set_axisbelow(True)
@@ -50,7 +50,7 @@ def latency_chart():
         ax.text(ms + 0.16, bar.get_y() + bar.get_height() / 2,
                 f"{ms:.4f} ms · {tflops:.3f} TFLOP/s", va="center", ha="left",
                 fontsize=9.5, color="#182230")
-    ax.text(0, -0.20, "One full-suite run, sorted by CUDA-event latency. Mojo is omitted because its interval includes host enqueue and synchronization.",
+    ax.text(0, -0.20, "One full-suite run, sorted by CUDA-event elapsed time. PyTorch measures its eager-op sequence; Mojo is omitted because it uses host enqueue + sync.",
             transform=ax.transAxes, fontsize=8.5, color="#526174")
     save(fig, "latency_comparison")
 
@@ -63,8 +63,8 @@ def throughput_chart():
     bars = ax.barh(y, TFLOPS, color=COLORS, height=0.58, edgecolor="none")
     ax.invert_yaxis()
     ax.set_yticks(y, NAMES, fontsize=11)
-    ax.set_xlim(0, 1.02)
-    ax.set_xticks(np.arange(0, 1.01, 0.2))
+    ax.set_xlim(0, 1.16)
+    ax.set_xticks(np.arange(0, 1.21, 0.2))
     ax.set_xlabel("Derived throughput (TFLOP/s)", fontsize=11, labelpad=9)
     ax.set_title("Derived compute rate", loc="left", fontsize=16, weight="bold", pad=16, color="#182230")
     ax.text(0, 1.015, "Calculated from the same CUDA-event latencies and nominal operation count", transform=ax.transAxes, fontsize=10, color="#526174")
@@ -117,8 +117,8 @@ def arrow(ax, start, end, color="#526174", lw=1.4, rad=0):
 def data_movement_diagram():
     fig, axes = plt.subplots(1, 2, figsize=(12, 5.5))
     fig.patch.set_facecolor("#FBFCFE")
-    fig.suptitle("CTA grouping reduces block count, not K/V load requests", x=0.06, y=0.98, ha="left", fontsize=16, weight="bold", color="#182230")
-    fig.text(0.06, 0.91, "Both mappings request about 1 GiB of logical K/V payload for this workload", fontsize=10, color="#526174")
+    fig.suptitle("PyTorch gather reuses K/V rows; current GPU kernels reload per query head", x=0.06, y=0.98, ha="left", fontsize=15, weight="bold", color="#182230")
+    fig.text(0.06, 0.91, "Logical selected K/V payload per workload invocation, inferred from the implementation mappings", fontsize=10, color="#526174")
     fig.subplots_adjust(top=0.79, bottom=0.16, left=0.04, right=0.98, wspace=0.08)
     for ax in axes:
         ax.set_xlim(0, 10)
@@ -127,26 +127,29 @@ def data_movement_diagram():
         ax.set_facecolor("#FBFCFE")
 
     ax = axes[0]
-    ax.set_title("Grouped · 2,048 CTAs", loc="left", fontsize=11, weight="bold", pad=10, color="#182230")
+    ax.set_title("PyTorch eager · batched gather", loc="left", fontsize=11, weight="bold", pad=10, color="#182230")
     box(ax, (0.25, 6.3), 2.05, 1.0, "K/V cache\n256 MiB allocated", "#EAF2F8", fs=9, weight="bold")
     boundary = FancyBboxPatch((3.1, 4.2), 6.2, 4.2, boxstyle="round,pad=0.04,rounding_size=0.08", facecolor="#F2F8F4", edgecolor="#8CC6A3", linewidth=1.2)
     ax.add_patch(boundary)
-    ax.text(6.2, 8.05, "One CTA · four query-head warps", ha="center", fontsize=9, weight="bold", color="#236B43")
+    ax.text(6.2, 8.05, "One gathered K/V tensor reused by 4 Q heads", ha="center", fontsize=8.5, weight="bold", color="#236B43")
     for i in range(4):
         y = 7.05 - i * 0.72
-        box(ax, (5.25, y), 3.1, 0.52, f"Warp / Q head {i} · loads K/V", "#E8F5EE", ec="#8CC6A3", fs=8)
+        box(ax, (5.25, y), 3.1, 0.52, f"Batched matmul for Q head {i}", "#E8F5EE", ec="#8CC6A3", fs=8)
         arrow(ax, (2.35, 6.8), (5.15, y + 0.26), "#2E8B57", 0.9, rad=(i - 1.5) * 0.055)
-    box(ax, (0.5, 1.35), 8.8, 1.15, "≈ 1 GiB logical K/V payload · 2,048 CTAs", "#E8F5EE", ec="#8CC6A3", fs=10, color="#236B43", weight="bold")
+    box(ax, (0.5, 1.35), 8.8, 1.15, "≈ 256 MiB logical K/V payload · gather once per KV head", "#E8F5EE", ec="#8CC6A3", fs=9.2, color="#236B43", weight="bold")
 
     ax = axes[1]
-    ax.set_title("Per query head · 8,192 CTAs/programs", loc="left", fontsize=11, weight="bold", pad=10, color="#182230")
+    ax.set_title("Fused CUDA / CuTe / Triton / Mojo mappings", loc="left", fontsize=11, weight="bold", pad=10, color="#182230")
     box(ax, (0.25, 6.3), 2.05, 1.0, "Same K/V cache\n256 MiB allocated", "#EAF2F8", fs=9, weight="bold")
+    boundary = FancyBboxPatch((3.0, 4.2), 6.5, 4.2, boxstyle="round,pad=0.04,rounding_size=0.08", facecolor="#FFF9F0", edgecolor="#E8B56A", linewidth=1.2)
+    ax.add_patch(boundary)
+    ax.text(6.25, 8.05, "4 query-head warps / programs each load K/V", ha="center", fontsize=8.5, weight="bold", color="#9A5700")
     for i in range(4):
-        y = 7.35 - i * 0.95
-        box(ax, (5.1, y), 3.55, 0.65, f"CTA / program · Q head {i}", "#FFF3E2", ec="#E8B56A", fs=8.5)
-        arrow(ax, (2.35, 6.8), (5.0, y + 0.32), "#D97706", 0.95, rad=(i - 1.5) * 0.07)
-    box(ax, (0.5, 1.35), 8.8, 1.15, "≈ 1 GiB logical K/V payload · 8,192 CTAs/programs", "#FFF3E2", ec="#E8B56A", fs=10, color="#9A5700", weight="bold")
-    fig.text(0.06, 0.04, "Logical load requests inferred from source and launch mapping; cache reuse can reduce physical DRAM traffic.", fontsize=9, color="#526174")
+        y = 7.35 - i * 0.72
+        box(ax, (5.15, y), 3.7, 0.52, f"Q head {i} · independent K/V loads", "#FFF3E2", ec="#E8B56A", fs=8)
+        arrow(ax, (2.35, 6.8), (5.05, y + 0.26), "#D97706", 0.9, rad=(i - 1.5) * 0.06)
+    box(ax, (0.5, 1.35), 8.8, 1.15, "≈ 1 GiB logical K/V payload · all 4 fused kernels", "#FFF3E2", ec="#E8B56A", fs=10, color="#9A5700", weight="bold")
+    fig.text(0.06, 0.04, "Physical DRAM traffic may be lower due to cache reuse. PyTorch has large gathered FP32 intermediates.", fontsize=9, color="#526174")
     save(fig, "kv_data_movement")
 
 

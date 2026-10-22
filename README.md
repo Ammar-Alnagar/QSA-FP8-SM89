@@ -9,13 +9,13 @@ This repository contains synthetic sparse Grouped-Query Attention (GQA) benchmar
 - FP8 E4M3FN K/V cache; BF16 query, gate, and output tensors
 - Fused sigmoid gate and online softmax
 
-The grouped kernels launch 2,048 CTAs at this size (one per request/KV-head); the baseline launches 8,192 (one per request/query-head). The cache now holds exactly the pages needed for Top-K instead of allocating 512 pages per request. Nsight Compute profiles measured 94–99% achieved occupancy across all four kernels; old 64-request timing figures do not describe this configuration.
+Grouped kernels launch 2,048 CTAs at this size (one per request/KV-head); baseline CuTe and Triton launch 8,192 (one per request/query-head). The cache holds exactly the pages needed for Top-K. Current Nsight Compute captures report 57.81–98.86% achieved occupancy across the five kernels; old 64-request timing figures do not describe this configuration.
 
 All five implementations report validation against either the shared PyTorch reference or an independent closed-form constant-input reference. The source also contains prior 64-request measurements and saved Nsight Compute captures. See [`wrtiteup.md`](wrtiteup.md) for their provenance and the current profiling status.
 
 ## Current run
 
-Run `python3 run_all.py` for the current five-kernel comparison table. CuTe and Triton use the shared randomized PyTorch reference; CUDA and Mojo use a constant-input closed-form check. Mojo timing includes enqueue plus synchronization. The checked-in Nsight profiles cover the four original implementations; Triton can be profiled with Nsight after it has compiled once. Full timing and profile details are in [`wrtiteup.md`](wrtiteup.md).
+Run `python3 run_all.py` for the current five-kernel comparison table. In the recorded run, CUDA-event speed order was Triton, raw CUDA, optimized CuTe, then baseline CuTe. CuTe and Triton use the shared randomized PyTorch reference; CUDA and Mojo use a constant-input closed-form check. Mojo timing includes enqueue plus synchronization, so it is not ranked against device-event timings. The write-up includes measured rates, logical K/V payload estimates, and the matching Nsight profiles with caveats in [`wrtiteup.md`](wrtiteup.md).
 
 ## Repository files
 
@@ -25,8 +25,8 @@ Run `python3 run_all.py` for the current five-kernel comparison table. CuTe and 
 - `sm89_mojo.mojo` — Mojo / MAX implementation
 - `sm89_triton.py` — Triton implementation with PyTorch reference validation
 - `run_all.py` — runs all five implementations and prints a comparison table
-- `qsa_sm89_*.ncu-rep` — saved Nsight Compute captures for baseline CuTe, optimized CuTe, and CUDA
-- `qsa_sm89_*_256.ncu-rep` — focused Nsight Compute profiles for all four kernels at the current 256-request shape
+- `qsa_sm89_*.ncu-rep` — saved Nsight Compute captures for the original CuTe/CUDA implementations
+- `qsa_sm89_*_256.ncu-rep` — focused Nsight Compute profiles for all five kernels at the current 256-request shape
 - [`wrtiteup.md`](wrtiteup.md) — implementation details, profiling notes, and measurement caveats
 
 ## Run

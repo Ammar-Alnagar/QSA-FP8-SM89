@@ -13,6 +13,10 @@ The grouped kernels launch 2,048 CTAs at this size (one per request/KV-head); th
 
 The source still contains prior 64-request measurements and saved Nsight Compute captures. See [`wrtiteup.md`](wrtiteup.md) for their provenance and the current profiling status. CuTe performs a reference comparison; CUDA and Mojo report validation as not checked because those paths do not calculate a reference comparison.
 
+## Current run
+
+RTX 4060 Laptop GPU, October 22, 2026. The optimized CuTe kernel measured 4.0915 ms and passed validation; the baseline measured 13.8669 ms and passed. Raw CUDA measured 3.8575 ms but has no reference check. Mojo reported 15.099 ms for enqueue plus synchronization, not isolated GPU time. The focused Nsight capture measured 95.15% achieved occupancy for optimized CuTe. Full timing and profile details are in [`wrtiteup.md`](wrtiteup.md).
+
 ## Repository files
 
 - `sm89_cutedsl.py` — optimized CuTe DSL kernel, one CTA per request/KV head

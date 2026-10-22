@@ -51,6 +51,21 @@ The baseline launch grid is `[256, 32, 1]`, with one CTA per query head. The fou
 
 Mojo also launches `[256, 8, 1]` with 128 threads per CTA and maps a warp to a query head. Its source uses `BLOCK_N = 32`, `unsafe_load[width=4]` for vector elements, and a compile-time five-step shuffle reduction. Invalid indices are skipped in the online-softmax state. The benchmark uses `perf_counter_ns` around 100 enqueues followed by `ctx.synchronize()`, so its reported interval includes host/runtime enqueue cost as well as GPU execution. It is labeled enqueue-plus-sync wall time and is not directly comparable to CUDA-event kernel timing. Mojo still has no reference comparison, so its output is marked not checked.
 
+## Current 256-request benchmark run
+
+The following run was collected on the RTX 4060 Laptop GPU on October 22, 2026. CuTe and CUDA use CUDA events; Mojo reports host wall time around enqueueing and synchronization. The E2E columns are the values printed by each script and do not represent a common timing interval.
+
+| Implementation | Kernel / timed interval | E2E reported | Derived rate | Validation |
+|---|---:|---:|---:|---|
+| Optimized CuTe DSL | 4.0915 ms | 25.988 ms | 0.525 TFLOP/s | max error 0.000004, PASS |
+| Baseline CuTe DSL | 13.8669 ms | 39.289 ms | 0.155 TFLOP/s | max error 0.00000, PASS |
+| Raw CUDA C++ | 3.8575 ms | 3.858 ms | 0.557 TFLOP/s | not checked |
+| Mojo / MAX | 15.099 ms enqueue+sync | — | 0.142 TFLOP/s* | not checked |
+
+Optimized CuTe is **3.39× faster** than the baseline by the CUDA-event timing in this run (`13.8669 / 4.0915`). CUDA's reported interval is 1.06× faster than optimized CuTe, but its output is not reference-validated. Mojo's displayed rate divides the nominal FLOP count by a host interval that includes enqueue overhead, so it is not a device throughput figure and should not be ranked with the CUDA-event rates.
+
+`*` The Mojo interval is the mean host enqueue-plus-synchronization time across 100 submissions. It is retained as printed for completeness, not as a GPU-only rate.
+
 ## Historical 64-request benchmark run
 
 The following values are transcribed from the earlier 64-request run. They do not measure the current 256-request configuration. CuTe and CUDA report CUDA-event kernel timing; their E2E columns are the scripts' separate end-to-end measurements. The old Mojo timing is host wall-clock time around enqueueing and synchronization.

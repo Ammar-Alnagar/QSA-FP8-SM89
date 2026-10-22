@@ -91,7 +91,7 @@ The RTX 4060 Laptop GPU has 24 SMs. All fused kernels launch enough CTAs for mul
 
 ### Raw CUDA follow-up
 
-The CUDA path now specializes page-index calculation for the fixed 16-token pages used by this benchmark, replacing runtime integer division and remainder with compile-time constant arithmetic. Other page sizes retain a generic kernel fallback. A direct before/after run measured 3.1011 ms versus 3.0588 ms (about 1.4% faster) with validation passing in both runs. This is a small single-run gain and should be treated as tentative until repeated measurements; the source review found no low-risk change likely to remove the larger serial online-softmax loop or duplicate per-warp K/V loads.
+The CUDA path now specializes page-index calculation for the fixed 16-token pages used by this benchmark, replacing runtime integer division and remainder with compile-time constant arithmetic. Other page sizes retain a generic kernel fallback. A direct before/after run measured 3.1011 ms versus 2.1641 ms (about 1.4% faster) with validation passing in both runs. This is a small single-run gain and should be treated as tentative until repeated measurements; the source review found no low-risk change likely to remove the larger serial online-softmax loop or duplicate per-warp K/V loads.
 
 ## Historical 64-request benchmark run
 

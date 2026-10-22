@@ -40,7 +40,8 @@ def run(label: str, command: list[str]) -> tuple[dict[str, str], bool]:
 
     if event_ms:
         result["time"] = f"{float(event_ms.group(1)):.4f} ms"
-        result["method"] = "CUDA events"
+        method = re.search(r"Timing method:\s*(.+)", proc.stdout)
+        result["method"] = method.group(1).strip() if method else "CUDA events"
     elif host_ms:
         result["time"] = f"{float(host_ms.group(1)):.3f} ms"
         result["method"] = "enqueue + sync"
@@ -86,6 +87,7 @@ def main() -> int:
     succeeded = True
 
     for label, script in (
+        ("PyTorch eager baseline", "sm89_torch.py"),
         ("Optimized CuTe", "sm89_cutedsl.py"),
         ("Baseline CuTe", "backup.py"),
         ("Triton", "sm89_triton.py"),

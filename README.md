@@ -8,14 +8,19 @@ This repository contains synthetic sparse Grouped-Query Attention (GQA) benchmar
 - Top-K 512, page size 16, 32 physical pages per request
 - FP8 E4M3FN K/V cache; BF16 query, gate, and output tensors
 - Fused sigmoid gate and online softmax
+- PyTorch reference environment: 2.14.1+cu130 (CUDA 13.0 build)
 
-Grouped kernels launch 2,048 CTAs at this size (one per request/KV-head); baseline CuTe and Triton launch 8,192 (one per request/query-head). The cache holds exactly the pages needed for Top-K. Current Nsight Compute captures report 57.81–98.86% achieved occupancy across the five kernels; old 64-request timing figures do not describe this configuration.
+Grouped kernels launch 2,048 CTAs at this size (one per request/KV-head); baseline CuTe and Triton launch 8,192 (one per request/query-head). All five mappings request about 1 GiB of logical K/V payload: grouped CTAs still issue separate K/V loads from each query-head warp. The cache holds exactly the pages needed for Top-K. Current Nsight Compute captures report 57.81–98.86% achieved occupancy across the five kernels; old 64-request timing figures do not describe this configuration.
 
 All five implementations report validation against either the shared PyTorch reference or an independent closed-form constant-input reference. The source also contains prior 64-request measurements and saved Nsight Compute captures. See [`wrtiteup.md`](wrtiteup.md) for their provenance and the current profiling status.
 
 ## Current run
 
 Run `python3 run_all.py` for the current five-kernel comparison table. In the recorded run, CUDA-event speed order was Triton, raw CUDA, optimized CuTe, then baseline CuTe. CuTe and Triton use the shared randomized PyTorch reference; CUDA and Mojo use a constant-input closed-form check. Mojo timing includes enqueue plus synchronization, so it is not ranked against device-event timings. The write-up includes measured rates, logical K/V payload estimates, and the matching Nsight profiles with caveats in [`wrtiteup.md`](wrtiteup.md).
+
+![CUDA-event kernel latency comparison](charts/latency_comparison.png)
+
+The write-up also includes a [CTA mapping and logical K/V movement diagram](charts/kv_data_movement.png).
 
 ## Repository files
 

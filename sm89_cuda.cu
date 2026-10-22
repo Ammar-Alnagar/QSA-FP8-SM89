@@ -77,7 +77,8 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
 // ── Raw CUDA C++ GQA Kernel ──────────────────────────────────────────────────
 // Grid:  [num_requests, num_kv_heads, 1]
 // Block: [128, 1, 1] (4 warps = 4 GQA query heads)
-extern "C" __global__ void qsa_sm89_gqa_cuda_kernel(
+template <int STATIC_PAGE_SIZE>
+__global__ void qsa_sm89_gqa_cuda_kernel(
     const __nv_bfloat16* __restrict__ q,
     const __nv_fp8_e4m3* __restrict__ k,
     const __nv_fp8_e4m3* __restrict__ v,
@@ -132,7 +133,8 @@ extern "C" __global__ void qsa_sm89_gqa_cuda_kernel(
     float nm = 0.0f;
     float mx = -1e20f;
 
-    const size_t stride_blk = (size_t)page_sz * num_kv_heads * head_dim;
+    constexpr int effective_page_sz = STATIC_PAGE_SIZE > 0 ? STATIC_PAGE_SIZE : 0;
+    const size_t stride_blk = (size_t)(STATIC_PAGE_SIZE > 0 ? effective_page_sz : page_sz) * num_kv_heads * head_dim;
     const size_t stride_po  = (size_t)num_kv_heads * head_dim;
     const size_t stride_kv  = (size_t)kv_head * head_dim;
 
@@ -143,8 +145,16 @@ extern "C" __global__ void qsa_sm89_gqa_cuda_kernel(
             int col = tile * DEFAULT_BLOCK_N + n;
             if (col < vc) {
                 int ltok = indices[row * (topk + 1) + col];
-                int lp = ltok / page_sz;
-                int po = ltok % page_sz;
+                int lp, po;
+                if constexpr (STATIC_PAGE_SIZE > 0) {
+                    // The benchmark's 16-token pages allow cheaper shift/mask
+                    // arithmetic. Other page sizes use the generic fallback.
+                    lp = ltok / STATIC_PAGE_SIZE;
+                    po = ltok % STATIC_PAGE_SIZE;
+                } else {
+                    lp = ltok / page_sz;
+                    po = ltok % page_sz;
+                }
 
                 int pb = -1;
                 if (ltok >= 0 && lp < max_pages) {
@@ -243,7 +253,8 @@ extern "C" void launch_qsa_cuda(
 ) {
     dim3 grid(nreqs, num_kv_heads, 1);
     dim3 block(128, 1, 1);
-    qsa_sm89_gqa_cuda_kernel<<<grid, block, 0, stream>>>(
+    if (page_sz == DEFAULT_PAGE_SIZE) {
+      qsa_sm89_gqa_cuda_kernel<DEFAULT_PAGE_SIZE><<<grid, block, 0, stream>>>(
         (const __nv_bfloat16*)q,
         (const __nv_fp8_e4m3*)k,
         (const __nv_fp8_e4m3*)v,
@@ -263,7 +274,30 @@ extern "C" void launch_qsa_cuda(
         max_pages,
         head_dim,
         group_sz
-    );
+      );
+    } else {
+      qsa_sm89_gqa_cuda_kernel<0><<<grid, block, 0, stream>>>(
+        (const __nv_bfloat16*)q,
+        (const __nv_fp8_e4m3*)k,
+        (const __nv_fp8_e4m3*)v,
+        (const int32_t*)indices,
+        (const int32_t*)btable,
+        t2r,
+        (const __nv_bfloat16*)gate,
+        (__nv_bfloat16*)out,
+        softmax_scale,
+        v_scale,
+        nblocks,
+        nreqs,
+        num_q_heads,
+        num_kv_heads,
+        topk,
+        page_sz,
+        max_pages,
+        head_dim,
+        group_sz
+      );
+    }
 }
 
 // ── Standalone Benchmark Main ────────────────────────────────────────────────

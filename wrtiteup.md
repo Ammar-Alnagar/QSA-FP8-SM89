@@ -4,6 +4,8 @@
 
 **Target used for the reported run:** NVIDIA GeForce RTX 4060 Laptop GPU, compute capability 8.9 (Ada Lovelace), 8 GiB VRAM
 
+**PyTorch reference environment:** PyTorch 2.14.1+cu130 (built with CUDA 13.0)
+
 **Current test workload:** 256 requests, 32 query heads, 8 KV heads, head dimension 128, Top-K 512, BF16 query/gate/output, FP8 E4M3FN K/V cache, page size 16, and 32 pages per request.
 
 This report describes the implementations and the larger test shape now configured in the sources. Focused Nsight Compute captures were collected on the RTX 4060 Laptop GPU for all five kernels at the 256-request shape. NCU durations are profiler-instrumented and are not normal benchmark latencies. The older timing figures below are retained only as historical results from the 64-request shape.
@@ -66,6 +68,8 @@ The following run was collected with `python3 run_all.py` on the RTX 4060 Laptop
 | 4 | Baseline CuTe DSL | 26.8541 ms | 41.601 ms | 0.080 TFLOP/s | max error 0.00000, PASS |
 | — | Mojo / MAX | 16.840 ms enqueue+sync | — | 0.127 TFLOP/s* | max error 0.00004883, PASS† |
 
+![CUDA-event latency comparison for the four kernels with comparable device timing](charts/latency_comparison.png)
+
 In this run, Triton had the lowest CUDA-event latency. Its test uses the same randomized data and PyTorch reference as CuTe. CUDA and Mojo passed their constant-fixture checks, which are narrower than the randomized reference comparison. Timings vary across runs; the table records one execution of the all-kernels command.
 
 `*` Mojo's reported rate divides the nominal FLOP count by host enqueue-plus-synchronization time, so it is not a GPU-only throughput and should not be ranked with CUDA-event rates. `†` CUDA/Mojo checks compare all output elements to the analytically expected BF16(0.05) output for their constant fixtures.
@@ -74,9 +78,15 @@ In this run, Triton had the lowest CUDA-event latency. Its test uses the same ra
 
 For comparable CUDA-event kernel times, the speed order is **Triton → raw CUDA → optimized CuTe → baseline CuTe**. The derived rate column follows the same order: **0.855 → 0.700 → 0.503 → 0.080 TFLOP/s**. Relative to optimized CuTe, this run measured Triton at 1.70× faster, raw CUDA at 1.39× faster, and baseline CuTe at 6.29× slower. These are single-run results; small timing changes can shift close rankings. Mojo is excluded because its enqueue-plus-sync wall interval includes host/runtime work.
 
-The K/V cache allocation is **256 MiB** (128 MiB each for K and V). Based on the launch mapping and Top-K, the grouped implementations (optimized CuTe, CUDA, Mojo) request about **256 MiB of K/V payload per invocation**: each of 2,048 request/KV-head CTAs consumes 128 KiB. Baseline CuTe and Triton request about **1 GiB logically** because 8,192 request/query-head programs each load the same 128 KiB K/V slice, repeating work across the four query heads sharing a KV head. These figures are logical requested payload from the kernel mapping, not measured DRAM bytes; cache reuse can lower physical traffic. Q and output each occupy about 2 MiB, while gate and index/block-table metadata are smaller.
+The K/V cache allocation is **256 MiB** (128 MiB each for K and V). Each query head's warp/program processes a 128 KiB K/V slice for its 512 selected tokens. The grouped kernels place four query-head warps in one CTA, but each warp still issues its own K/V loads; therefore the grouped kernels, baseline CuTe, and Triton all request about **1 GiB of logical K/V payload per invocation**. Grouping reduces the CTA count from 8,192 to 2,048, but the current source does not share K/V loads across those four warps. These are logical requested bytes, not measured DRAM bytes; cache reuse can reduce physical traffic. Q and output each occupy about 2 MiB, while gate and index/block-table metadata are smaller.
 
-The RTX 4060 Laptop GPU has 24 SMs. All kernels launch enough CTAs for multiple waves, but their mapping and generated work differ. Triton leads this run despite the repeated logical K/V requests: its Nsight capture reports 86.31% SM throughput and 41.35% DRAM throughput, with 72 registers/thread and 57.81% achieved occupancy. This indicates strong utilization for this implementation, but does not isolate a single cause; cache reuse means the 1 GiB logical request estimate does not imply 1 GiB from DRAM. Raw CUDA and optimized CuTe use the grouped mapping and avoid the fourfold logical K/V repetition. CUDA measured faster here; its capture has 34 registers/thread and 94.80% occupancy versus CuTe's 38 registers and 95.15%, but these counters alone do not establish why. The baseline's per-query-head CTA mapping repeats K/V work and adds shared-memory cross-warp reduction and barriers; it is slowest in this run even though its achieved occupancy is high. Mojo has grouped mapping and similar occupancy, but its displayed host timing cannot support a GPU-kernel speed ranking.
+![Diagram comparing grouped and per-query-head CTA mappings and their logical K/V payload](charts/kv_data_movement.png)
+
+The RTX 4060 Laptop GPU has 24 SMs. All kernels launch enough CTAs for multiple waves, but their mapping and generated work differ. Triton leads this run despite requesting the same logical K/V volume: its Nsight capture reports 86.31% SM throughput and 41.35% DRAM throughput, with 72 registers/thread and 57.81% achieved occupancy. This indicates strong utilization for this implementation, but does not isolate a single cause; cache reuse means the 1 GiB logical request estimate does not imply 1 GiB from DRAM. Raw CUDA and optimized CuTe use the grouped mapping, reducing CTA count while still issuing duplicate warp-level K/V loads. CUDA measured faster here; its capture has 34 registers/thread and 94.80% occupancy versus CuTe's 38 registers and 95.15%, but these counters alone do not establish why. The baseline's per-query-head CTA mapping repeats K/V work and adds shared-memory cross-warp reduction and barriers; it is slowest in this run even though its achieved occupancy is high. Mojo has grouped mapping and similar occupancy, but its displayed host timing cannot support a GPU-kernel speed ranking.
+
+### Raw CUDA follow-up
+
+The CUDA path now specializes page-index calculation for the fixed 16-token pages used by this benchmark, replacing runtime integer division and remainder with compile-time constant arithmetic. Other page sizes retain a generic kernel fallback. A direct before/after run measured 3.1011 ms versus 3.0588 ms (about 1.4% faster) with validation passing in both runs. This is a small single-run gain and should be treated as tentative until repeated measurements; the source review found no low-risk change likely to remove the larger serial online-softmax loop or duplicate per-warp K/V loads.
 
 ## Historical 64-request benchmark run
 

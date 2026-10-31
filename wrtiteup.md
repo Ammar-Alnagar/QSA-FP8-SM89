@@ -56,6 +56,465 @@ Triton launches one program per `(request, query head)` (8,192 programs). Each p
 
 Mojo also launches `[256, 8, 1]` with 128 threads per CTA and maps a warp to a query head. Its source uses `BLOCK_N = 32`, `unsafe_load[width=4]` for vector elements, and a compile-time five-step shuffle reduction. Invalid indices are skipped in the online-softmax state. The benchmark uses `perf_counter_ns` around 100 enqueues followed by `ctx.synchronize()`, so its reported interval includes host/runtime enqueue cost as well as GPU execution. It is labeled enqueue-plus-sync wall time and is not directly comparable to CUDA-event kernel timing. Its constant-input output is checked against BF16(0.05).
 
+
+## Architectural Deep Dive: Attention, Kernel, and Memory Flow
+
+This section details the mathematical mechanics, thread execution models, paged memory hierarchies, and SM89 hardware interactions across all six implementations, supported by formal Mermaid flowcharts and structural ASCII diagrams.
+
+### 1. Mathematical Formulation & Attention Algorithmic Flow
+
+Sparse Paged Grouped-Query Attention (GQA) with fused sigmoid gating computes attention over a dynamically selected subset of key-value tokens (Top-K = 512).
+
+#### Formal Equations
+1. **Paging & Token Resolution**:
+   Given logical token index $t \in [0, K-1]$ for request $r$:
+   $$\text{logical\_page}(t) = \lfloor t / P \rfloor, \quad \text{page\_offset}(t) = t \pmod P$$
+   $$\text{physical\_block}(t) = \text{BlockTable}[r, \text{logical\_page}(t)]$$
+   $$\text{physical\_offset}(t) = (\text{physical\_block}(t) \times P + \text{page\_offset}(t)) \times H_{kv} \times D + g \times D$$
+   where $P = 16$ (page size), $H_{kv} = 8$ (KV heads), $D = 128$ (head dimension), and $g = \lfloor h / G \rfloor$ with group size $G = H_q / H_{kv} = 4$.
+
+2. **Attention Scoring & Online Softmax**:
+   Let $q_{r,h} \in \mathbb{R}^D$ and $k_{t,g} \in \mathbb{R}^D$:
+   $$S_{t} = \frac{q_{r,h} \cdot (k_{t,g} \times s_k)}{\sqrt{D}} = (q_{r,h} \cdot k_{t,g}) \times \text{scale}$$
+   To avoid two-pass softmax, kernels maintain online running max $m^{(n)}$ and normalizer $d^{(n)}$:
+   $$m^{(n)} = \max(m^{(n-1)}, S_n), \quad \alpha = 2^{m^{(n-1)} - m^{(n)}}, \quad p_n = 2^{S_n - m^{(n)}}$$
+   $$d^{(n)} = d^{(n-1)} \cdot \alpha + p_n, \quad \text{acc}^{(n)} = \text{acc}^{(n-1)} \cdot \alpha + p_n \cdot v_{t,g}$$
+   where $\text{scale} = \frac{s_k}{\sqrt{D}} \log_2(e)$ folds base-2 conversion directly into the scale factor.
+
+3. **Gating & Normalization**:
+   After processing all $K = 512$ tokens:
+   $$\text{ctx}_{r,h} = \frac{\text{acc}^{(K)}}{d^{(K)}} \times s_v, \quad \text{out}_{r,h} = \text{ctx}_{r,h} \odot \sigma(\text{gate}_{r,h})$$
+   where $\sigma(x) = \frac{1}{1 + 2^{-x \log_2(e)}}$.
+
+#### Attention & Online Softmax Flowchart (Mermaid)
+
+```mermaid
+flowchart TD
+    subgraph Inputs ["Workload Inputs (BF16 & FP8)"]
+        Q["Query Q [256, 32, 128] (BF16)"]
+        Gate["Gate [256, 32, 128] (BF16)"]
+        KCache["K Cache [256 MiB total] (FP8 E4M3)"]
+        VCache["V Cache [256 MiB total] (FP8 E4M3)"]
+        BTable["Block Table [256, 32] (Int32)"]
+        Idx["Token Indices [256, 513] (Int32)"]
+    end
+
+    subgraph PerCTA ["Execution Tile (Block_N = 32 Tokens)"]
+        Resolve["Token Resolution: lp = ltok / 16, po = ltok % 16, pb = BTable[req, lp]"]
+        LoadKV["Coalesced 128-Byte Load: 4x FP8 per thread across 32 lanes"]
+        CVT["SM89 Hardware Convert: cvt.rn.f16x2.e4m3x2 -> FP32"]
+        DotProd["Partial Dot Product: 4-dim FMA per lane"]
+        Bfly["Intra-Warp Butterfly Reduction (5 XOR shuffles) -> Scalar Score"]
+        OnlineSoftmax["Online Softmax Update: m_new = max(m, score), alpha = 2^(m - m_new), p = 2^(score - m_new)"]
+        AccVal["Value Accumulation: acc = acc * alpha + p * V"]
+    end
+
+    subgraph Epilogue ["Epilogue & Gating"]
+        Norm["Final Normalization: ctx = (acc / safe_norm) * v_scale"]
+        Sigmoid["Fast Sigmoid: sig = 1.0 / (1.0 + exp2(-gate * log2e))"]
+        StoreOut["Vectorized Store: Out [256, 32, 128] (BF16)"]
+    end
+
+    Inputs --> Resolve
+    Resolve --> LoadKV
+    LoadKV --> CVT
+    CVT --> DotProd
+    DotProd --> Bfly
+    Bfly --> OnlineSoftmax
+    OnlineSoftmax --> AccVal
+    AccVal -- "Next Token in Tile" --> Resolve
+    AccVal -- "Tokens Complete" --> Norm
+    Gate --> Sigmoid
+    Norm --> StoreOut
+    Sigmoid --> StoreOut
+```
+
+#### Attention Computational Pipeline (ASCII)
+
+```
+===================================================================================================================
+                       SPARSE PAGED GQA ATTENTION PIPELINE (PER WARP / QUERY HEAD)
+===================================================================================================================
+
+  Input Query Q [BF16]            Token Index [Int32]
+  [d0..d127] (4 per lane)                 |
+          |                              v
+          |                 +--------------------------+
+          |                 | Page Lookup & Resolution |
+          |                 | lp = t / 16; po = t % 16 |
+          |                 | pb = BlockTable[req, lp] |
+          |                 +--------------------------+
+          |                              |
+          |                              v
+          |                     Paged K/V Cache [FP8]
+          |                     pb, po, kv_head, d[0..3]
+          |                              |
+          |           +------------------+------------------+
+          |           |                                     |
+          |           v (32-bit load / lane)                v (32-bit load / lane)
+          |     Key Vector [FP8x4]                    Value Vector [FP8x4]
+          |           |                                     |
+          |           v [SM89 cvt.rn.f16x2.e4m3x2]          v [SM89 cvt.rn.f16x2.e4m3x2]
+          |     Key Vector [FP32x4]                   Value Vector [FP32x4]
+          |           |                                     |
+          +------> [ FMA ]                                  |
+                      |                                     |
+         partial dot (4 dims/lane)                          |
+                      |                                     |
+         [ 5-Stage Butterfly Shuffle ]                      |
+         (lane XOR: 16, 8, 4, 2, 1)                         |
+                      |                                     |
+             Scalar Score (S_t)                             |
+                      |                                     |
+                      v                                     |
+         +--------------------------+                       |
+         |  Online Softmax Rescale  |                       |
+         |  new_max = max(max, S)   |                       |
+         |  alpha = 2^(max - new_m) |                       |
+         |  p = 2^(S - new_m)       |                       |
+         +--------------------------+                       |
+           |                      |                         |
+           | (rescale factor)     | (weight p)              |
+           v                      v                         |
+       [ norm ]               [ acc ] <---------------------+ (accumulate: acc*alpha + p*V)
+       (norm*alpha + p)           |
+           |                      |
+           v                      v
+      Final Safe Norm        Final Acc [FP32x4]
+           |                      |
+           +----------+-----------+
+                      |
+                      v
+             ctx = (acc / safe_norm) * v_scale
+                      |
+                      +<---------------- Gate Vector [BF16x4] -> fast_sigmoid(gate)
+                      |
+                      v
+             out = ctx * sigmoid(gate)  [FP32x4 -> BF16x4]
+                      |
+                      v
+             64-bit Vector Store to Global VRAM
+===================================================================================================================
+```
+
+---
+
+### 2. Execution Models Across Kernels
+
+The benchmark compares six distinct implementations, representing four primary execution archetypes:
+1. **Grouped Warp-Specialized Kernels** (Raw CUDA, Optimized CuTe DSL, Mojo / MAX)
+2. **Per-Query-Head Shared-Memory Cooperative Kernel** (Baseline CuTe DSL)
+3. **Vectorized 2D Program Tile Kernel** (Triton)
+4. **Multi-Pass Framework Dispatch Pipeline** (Eager PyTorch)
+
+#### Execution Archetype Comparison Matrix
+
+| Architectural Feature | Raw CUDA C++ | Optimized CuTe DSL | Mojo / MAX | Baseline CuTe DSL | Triton | PyTorch Eager |
+|---|---|---|---|---|---|---|
+| **Grid Configuration** | `[256, 8, 1]` (2,048) | `[256, 8, 1]` (2,048) | `[256, 8, 1]` (2,048) | `[256, 32, 1]` (8,192) | `(8192,)` (8,192) | Multi-kernel dispatch |
+| **Threads per CTA / Program**| 128 (4 warps) | 128 (4 warps) | 128 (4 warps) | 128 (4 warps) | 128 (num_warps=4) | Variable (ATen ops) |
+| **CTA Work Mapping** | 1 (req, kv_head) | 1 (req, kv_head) | 1 (req, kv_head) | 1 (req, q_head) | 1 (req, q_head) | Tensor-wide passes |
+| **Warp Role** | 1 Warp = 1 Q-head | 1 Warp = 1 Q-head | 1 Warp = 1 Q-head | 4 Warps = 1 Q-head | Vector cooperative | Framework scheduled |
+| **QK Dot Reduction** | 5 Butterfly shuffles | 5 Butterfly shuffles | 5 Butterfly shuffles | Warp shfl + SMEM + Bar | `tl.sum(..., axis=1)` | Batched GEMM (BLAS) |
+| **Shared Memory / Block** | 0 Bytes | 0 Bytes | 0 Bytes | 16 Bytes (4 floats) | Managed by compiler | N/A |
+| **Barrier Synchronizations** | 0 barriers | 0 barriers | 0 barriers | 2 barriers / token | Compiler pipelined | Host/Stream syncs |
+| **FP8 Conversion** | PTX `cvt.rn.f16x2` | CUTLASS Wrapper | `unsafe_load` SIMD | CUTLASS Wrapper | Native Triton cast | Advanced index + cast |
+| **Measured Kernel Latency** | **2.1641 ms** | **4.4411 ms** | 12.985 ms (host) | **15.4536 ms** | **2.4420 ms** | **31.0188 ms** (events) |
+| **Achieved Occupancy** | 94.98% | 95.15% | 94.01% | 98.86% | 57.81% | N/A |
+| **Registers per Thread** | 35 | 38 | 38 | 40 | 72 | N/A |
+| **SM Throughput (NCU)** | 74.92% | 75.19% | 89.96% | 70.13% | 86.31% | N/A |
+| **DRAM Throughput (NCU)** | 40.16% | 27.23% | 8.05% | 15.46% | 41.35% | N/A |
+
+#### Thread-to-Warp-to-CTA Execution Hierarchy (ASCII)
+
+```
+-------------------------------------------------------------------------------------------------------------------
+ ARCHETYPE A: GROUPED WARP-SPECIALIZED EXECUTION (Raw CUDA, Optimized CuTe, Mojo)
+ Grid: [256, 8, 1] = 2,048 CTAs  |  CTA: 128 Threads  |  smem = 0 Bytes  |  Barriers = 0
+-------------------------------------------------------------------------------------------------------------------
+ CTA (Request r, KV-Head g):
+ ┌───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+ │ Warp 0 (Threads 0..31):   Handles Query Head h0 = g*4 + 0                                                     │
+ │   Lane  0: d[0..3]   | Lane  1: d[4..7]   | ... | Lane 31: d[124..127]  --> 32x4 = 128 dims                  │
+ │   Intra-Warp Reduction: __shfl_xor_sync (16,8,4,2,1) -> 5 cycles in register datapath (No SMEM, No Sync)     │
+ ├───────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ Warp 1 (Threads 32..63):  Handles Query Head h1 = g*4 + 1                                                     │
+ │   Lane  0: d[0..3]   | Lane  1: d[4..7]   | ... | Lane 31: d[124..127]  --> 32x4 = 128 dims                  │
+ │   Intra-Warp Reduction: __shfl_xor_sync (16,8,4,2,1) -> 5 cycles in register datapath (No SMEM, No Sync)     │
+ ├───────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ Warp 2 (Threads 64..95):  Handles Query Head h2 = g*4 + 2                                                     │
+ │   Lane  0: d[0..3]   | Lane  1: d[4..7]   | ... | Lane 31: d[124..127]  --> 32x4 = 128 dims                  │
+ │   Intra-Warp Reduction: __shfl_xor_sync (16,8,4,2,1) -> 5 cycles in register datapath (No SMEM, No Sync)     │
+ ├───────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ Warp 3 (Threads 96..127): Handles Query Head h3 = g*4 + 3                                                     │
+ │   Lane  0: d[0..3]   | Lane  1: d[4..7]   | ... | Lane 31: d[124..127]  --> 32x4 = 128 dims                  │
+ │   Intra-Warp Reduction: __shfl_xor_sync (16,8,4,2,1) -> 5 cycles in register datapath (No SMEM, No Sync)     │
+ └───────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+-------------------------------------------------------------------------------------------------------------------
+ ARCHETYPE B: BASELINE CROSS-WARP COOPERATIVE EXECUTION (Backup CuTe DSL)
+ Grid: [256, 32, 1] = 8,192 CTAs  |  CTA: 128 Threads  |  smem = 16 Bytes  |  2 __syncthreads() per token
+-------------------------------------------------------------------------------------------------------------------
+ CTA (Request r, Query Head h):
+ ┌───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+ │ All 4 Warps (128 threads) cooperate on the SINGLE Query Head h:                                               │
+ │   Thread d in [0..127] holds 1 dimension coordinate (qd * kd)                                                 │
+ │   Step 1: Warp shuffle reduces within each 32-thread warp (4 partial sums)                                    │
+ │   Step 2: Lane 0 of each warp writes partial sum to smem[warp_id]                                             │
+ │   Step 3: __syncthreads() barrier (all warps pause)                                                           │
+ │   Step 4: Thread 0 sums smem[0..3] and multiplies by softmax_scale                                            │
+ │   Step 5: __syncthreads() barrier (all warps pause before reading score)                                      │
+ │   Step 6: All 128 threads resume to update online softmax and value accumulators                              │
+ └───────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+   Result: High theoretical occupancy (98.86%), but serialized execution waves and high barrier stall overhead!
+```
+
+#### Detailed Kernel Execution Flowcharts (Mermaid)
+
+```mermaid
+graph TD
+    subgraph GroupedArch ["Grouped Warp-Specialized Architecture (CUDA / CuTe / Mojo)"]
+        CTA_G["CTA Grid: [256, 8, 1]<br>1 CTA per (Request, KV Head)"]
+        W0["Warp 0: Query Head 0<br>32 lanes x 4 dims = 128D"]
+        W1["Warp 1: Query Head 1<br>32 lanes x 4 dims = 128D"]
+        W2["Warp 2: Query Head 2<br>32 lanes x 4 dims = 128D"]
+        W3["Warp 3: Query Head 3<br>32 lanes x 4 dims = 128D"]
+
+        Bfly0["5-cycle Butterfly XOR<br>Registers only<br>0 SMEM / 0 Sync"]
+        Bfly1["5-cycle Butterfly XOR<br>Registers only<br>0 SMEM / 0 Sync"]
+        Bfly2["5-cycle Butterfly XOR<br>Registers only<br>0 SMEM / 0 Sync"]
+        Bfly3["5-cycle Butterfly XOR<br>Registers only<br>0 SMEM / 0 Sync"]
+
+        CTA_G --> W0 & W1 & W2 & W3
+        W0 --> Bfly0
+        W1 --> Bfly1
+        W2 --> Bfly2
+        W3 --> Bfly3
+    end
+
+    subgraph BaselineArch ["Baseline Cooperative Architecture (backup.py)"]
+        CTA_B["CTA Grid: [256, 32, 1]<br>1 CTA per (Request, Q Head)<br>8,192 CTAs Total"]
+        WarpCollab["4 Warps (128 threads)<br>Each thread = 1 Head Dim"]
+        SMEM_Store["Lane 0 writes to SMEM[warp_id]<br>smem: 4 floats (16 bytes)"]
+        Sync1["__syncthreads() Barrier 1"]
+        SumSMEM["Thread 0 reduces SMEM[0..3]"]
+        Sync2["__syncthreads() Barrier 2"]
+
+        CTA_B --> WarpCollab
+        WarpCollab --> SMEM_Store
+        SMEM_Store --> Sync1
+        Sync1 --> SumSMEM
+        SumSMEM --> Sync2
+    end
+```
+
+```mermaid
+graph TD
+    subgraph TritonArch ["Triton Vectorized 2D Program Tile Architecture (sm89_triton.py)"]
+        GridT["Program Grid: (8,192,)<br>1 Program per (Request, Query Head)<br>num_warps=4 (128 threads)"]
+        TileLoop["Fixed Trip Loop: block_start = 0 to 512 step 32<br>token_offsets = tl.arange(0, 32)"]
+        MaskLoads["Vectorized Masked Load (32 x 128):<br>k_values: [32, 128] FP32<br>v_values: [32, 128] FP32"]
+        DotScores["Vector Tile Dot Product:<br>scores = tl.sum(k_values * query[None, :], axis=1) * scale_log2"]
+        OnlineMax["Tile-Level Online Softmax:<br>block_max = tl.max(scores)<br>next_max = max(running_max, block_max)<br>alpha = exp2(running_max - next_max)"]
+        AccumPV["Tile Accumulation:<br>normalizer = normalizer * alpha + sum(prob)<br>value_acc = value_acc * alpha + sum(prob[:, None] * v_values)"]
+        StoreT["Final Gated Store:<br>out = (value_acc * (v_scale / normalizer)) * sigmoid(gate)"]
+
+        GridT --> TileLoop
+        TileLoop --> MaskLoads
+        MaskLoads --> DotScores
+        DotScores --> OnlineMax
+        OnlineMax --> AccumPV
+        AccumPV -- "Loop next 32-token tile" --> MaskLoads
+        AccumPV -- "All 512 tokens completed" --> StoreT
+    end
+
+    subgraph PyTorchArch ["PyTorch Eager Multi-Pass Pipeline (sm89_torch.py)"]
+        GatherPass["1. Index Gather Pass:<br>keys = k[physical_page, page_offset]<br>values = v[physical_page, page_offset]<br>Reused across 4 Q-heads (256 MiB payload)"]
+        CastFP32["2. Type Promotion & Reshape:<br>K: [256, 8, 512, 128] FP32<br>V: [256, 8, 512, 128] FP32 (~1.5 GiB Intermediates)"]
+        BMM1["3. Batched Matmul QK:<br>scores = torch.matmul(queries, keys) * scale"]
+        SoftmaxPass["4. Softmax Kernel:<br>prob = torch.softmax(scores.masked_fill(~valid, -inf))"]
+        BMM2["5. Batched Matmul PV:<br>context = torch.matmul(prob, values) * v_scale"]
+        GatePass["6. Elementwise Sigmoid Gate:<br>out = context * sigmoid(gate)"]
+
+        GatherPass --> CastFP32
+        CastFP32 --> BMM1
+        BMM1 --> SoftmaxPass
+        SoftmaxPass --> BMM2
+        BMM2 --> GatePass
+    end
+```
+
+---
+
+### 3. Memory Flow, Paged Hierarchy, and SM89 Coalescing
+
+Sparse Paged GQA execution speed is heavily governed by memory bandwidth, cache line utilization, and register spills.
+
+#### Hardware Memory Hierarchy Flow (Mermaid)
+
+```mermaid
+flowchart TD
+    subgraph GlobalMem ["Global DRAM Memory (8 GiB VRAM on RTX 4060 Laptop)"]
+        KCacheDRAM["Physical K Cache (128 MiB FP8)"]
+        VCacheDRAM["Physical V Cache (128 MiB FP8)"]
+        TableDRAM["Block Table & Indices (Int32)"]
+        QDRAM["Query & Gate Tensors (BF16)"]
+    end
+
+    subgraph L2Subsystem ["L2 Cache Subsystem (32 MiB on Ada SM89 AD107)"]
+        L2K["L2 Cached K/V Pages<br>(High hit rate for active Top-K pages)"]
+        L2BTable["L2 Cached Block Table Lines"]
+    end
+
+    subgraph SM_Level ["Streaming Multiprocessor (24 SMs on SM89)"]
+        subgraph L1_TEX ["L1 / Texture Cache (128 KiB per SM)"]
+            L1Lines["128-Byte Cache Lines"]
+        end
+
+        subgraph WarpRegisters ["Warp Register Files (64K 32-bit registers per SM)"]
+            QReg["Query Regs: 4x BF16 (64-bit load)"]
+            KReg["Key Regs: 4x FP8 packed in 32-bit reg"]
+            PTX_CVT["SM89 Hardware Unit: cvt.rn.f16x2.e4m3x2"]
+            FP32Reg["Unpacked FP32 Arithmetic Accumulators (acc0..acc3, nm, mx)"]
+        end
+    end
+
+    GlobalMem --> L2Subsystem
+    L2Subsystem --> L1_TEX
+    L1_TEX --> WarpRegisters
+    KCacheDRAM -.-> L2K
+    VCacheDRAM -.-> L2K
+    L2K --> L1Lines
+    L1Lines -- "32 lanes x 4B = 128B Coalesced" --> KReg
+    KReg --> PTX_CVT
+    PTX_CVT --> FP32Reg
+```
+
+#### Coalescing & Vectorization on SM89 Hardware (ASCII)
+
+On NVIDIA Ada Lovelace GPUs (SM89), memory transactions are serviced in **128-byte sectors**. The memory access alignment in the grouped kernels is precisely structured to saturate memory buses with zero wasted bandwidth:
+
+```
+===================================================================================================================
+               SM89 128-BYTE COALESCED MEMORY ACCESS PATTERN (PER WARP LOAD)
+===================================================================================================================
+
+ Physical K/V Cache: Stride across head dimensions = 1 byte per FP8 element.
+ Head Dimension D = 128. Warp Size = 32 threads.
+
+ Lane 00: loads bytes   0,   1,   2,   3  ──>  uint32_t (4 bytes)
+ Lane 01: loads bytes   4,   5,   6,   7  ──>  uint32_t (4 bytes)
+ Lane 02: loads bytes   8,   9,  10,  11  ──>  uint32_t (4 bytes)
+ ...
+ Lane 31: loads bytes 124, 125, 126, 127  ──>  uint32_t (4 bytes)
+
+ Total contiguous bytes requested by warp in 1 instruction:
+   32 threads x 4 bytes = 128 contiguous bytes = EXACTLY 1 NATIVE SM89 CACHE LINE!
+
+ ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+ │                         Single 128-Byte Native L1/L2 Cache Transaction                      │
+ ├────────────┬────────────┬────────────┬────────────┬────────────┬────────────┬───────────────┤
+ │ Lane 0 (4B)│ Lane 1 (4B)│ Lane 2 (4B)│ Lane 3 (4B)│   ...      │Lane 30 (4B)│ Lane 31 (4B)  │
+ └────────────┴────────────┴────────────┴────────────┴────────────┴────────────┴───────────────┘
+  [100% Coalescing Efficiency — No bus splitting, No uncoalesced replays, Minimal DRAM traffic]
+
+ Next: Hardware Unpacking with inline PTX:
+   asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h2_lo) : "h"(lo_16bits));
+   asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h2_hi) : "h"(hi_16bits));
+   Direct 1-cycle ALU conversion from FP8 to FP16 pairs, promoted immediately to FP32 registers.
+===================================================================================================================
+```
+
+#### Logical vs. Physical Data Movement
+
+```
+  Workload Cache Footprint:
+  - Total Physical K Cache: 256 reqs * 32 pages * 16 tokens * 8 KV heads * 128 bytes = 128 MiB
+  - Total Physical V Cache: 256 reqs * 32 pages * 16 tokens * 8 KV heads * 128 bytes = 128 MiB
+  - Combined Physical Allocation: 256 MiB
+
+  Logical K/V Payload Request:
+  - PyTorch Eager:
+      Gathers unique (physical_block, page_offset) rows once per KV head.
+      Logical payload: 256 MiB.
+      Tradeoff: Allocates massive intermediate gathered FP32 tensors (~1.5 GiB temporary VRAM).
+  - Fused GPU Kernels (CUDA, CuTe, Triton, Mojo):
+      Each query head loads its corresponding KV head's rows independently.
+      4 query heads per KV head * 256 MiB = 1,024 MiB (1 GiB) logical payload.
+      Tradeoff: Relies on high L1/L2 cache hit rate (L2 cache on AD107 is 32 MiB) to avoid physical DRAM thrashing.
+```
+
+---
+
+### 4. NCU Profiling Analysis & Microarchitectural Dynamics
+
+The Nsight Compute (NCU) metrics collected on the RTX 4060 Laptop GPU reveal deep insights into execution stalls, register pressure, and wave quantization.
+
+#### Detailed Comparative Hardware Metrics Table
+
+| Metric | Optimized CuTe | Baseline CuTe | Raw CUDA (Specialized) | Mojo / MAX | Triton |
+|---|---|---|---|---|---|
+| **NCU Profile File** | `qsa_sm89_cutedsl_256.ncu-rep` | `qsa_sm89_baseline_256.ncu-rep` | `qsa_sm89_raw_cuda_final.ncu-rep` | `qsa_sm89_mojo_256.ncu-rep` | `qsa_sm89_triton_256.ncu-rep` |
+| **Grid CTAs** | 2,048 | 8,192 | 2,048 | 2,048 | 8,192 |
+| **Threads / Block** | 128 | 128 | 128 | 128 | 128 |
+| **NCU Duration (Replay)**| 4.013 ms | 13.725 ms | 2.840 ms | 13.824 ms | 2.651 ms |
+| **Benchmark Event Latency**| 4.4411 ms | 15.4536 ms | 2.1641 ms | 12.985 ms (host) | 2.4420 ms |
+| **Derived Rate** | 0.484 TFLOP/s | 0.139 TFLOP/s | 0.992 TFLOP/s | 0.165 TFLOP/s | 0.879 TFLOP/s |
+| **Achieved Occupancy** | 95.15% | 98.86% | 94.98% | 94.01% | 57.81% |
+| **Registers / Thread** | 38 | 40 | 35 | 38 | 72 |
+| **Waves / SM (24 SMs)** | 7.11 | 28.44 | 7.11 | 7.11 | 48.76 |
+| **SM Throughput** | 75.19% | 70.13% | 74.92% | 89.96% | 86.31% |
+| **Memory Throughput** | 69.20% | 70.13% | 59.00% | 20.10% | 86.31% |
+| **DRAM Throughput** | 27.23% | 15.46% | 40.16% | 8.05% | 41.35% |
+| **Shared Memory / Block** | 0 Bytes | 16 Bytes | 0 Bytes | 0 Bytes | 0 Bytes |
+| **Primary Stall Reason** | Short Scoreboard / Wait | Barrier Synchronization | MIO / Math Pipe | Instruction Dispatch | Long Scoreboard (L1/L2 miss) |
+
+#### Roofline & Execution Dynamics (ASCII)
+
+```
+===================================================================================================================
+                       SM89 COMPUTE & MEMORY UTILIZATION DYNAMICS
+===================================================================================================================
+
+  Peak SM89 Compute
+  ^
+  │                                                      [Triton]
+  │                                                SM Thru: 86.31%
+  │                                 [Raw CUDA]     DRAM Thru: 41.35%
+  │                           SM Thru: 74.92%      Occ: 57.81% (72 Regs)
+  │                           DRAM Thru: 40.16%    Latency: 2.44 ms
+  │                           Occ: 94.98% (35 Regs)
+  │                           Latency: 2.16 ms
+  │
+  │                  [Optimized CuTe]
+  │             SM Thru: 75.19%
+  │             DRAM Thru: 27.23%
+  │             Occ: 95.15% (38 Regs)
+  │             Latency: 4.44 ms
+  │
+  │                                    [Baseline CuTe]
+  │                               SM Thru: 70.13%
+  │                               DRAM Thru: 15.46%
+  │                               Occ: 98.86% (SMEM + Barrier Stalls)
+  │                               Latency: 15.45 ms
+  │
+  │   [Mojo / MAX]
+  │   SM Thru: 89.96%
+  │   DRAM Thru: 8.05%
+  │   Latency: 12.98 ms (host enqueue + sync)
+  │
+  └─────────────────────────────────────────────────────────────────────────────> Operational Intensity (FLOP/Byte)
+
+ KEY ARCHITECTURAL TAKEAWAYS:
+ 1. High Occupancy != High Performance: Baseline CuTe achieved 98.86% occupancy but was over 7x slower than
+    Raw CUDA. Thread serialization and repeated `__syncthreads()` cross-warp barriers wasted execution slots.
+ 2. Register Budget vs Latency Hiding: Triton traded occupancy (57.81% achieved with 72 registers/thread)
+    for massive vector tile unrolling (32 tokens), achieving 86.31% SM throughput and 41.35% DRAM throughput.
+ 3. Butterfly Reduction Eliminates Barriers: Grouped kernels (CUDA, Optimized CuTe) achieved 95% occupancy
+    with 35-38 registers, using intra-warp shuffles to resolve reductions with zero shared memory latency.
+===================================================================================================================
+```
+
 ## Current 256-request benchmark run
 
 The following run was collected with `python3 run_all.py` on the RTX 4060 Laptop GPU. Fused CuTe, Triton, and CUDA kernels use CUDA events. PyTorch eager timing measures its sequence of PyTorch operations with CUDA events; its wall-clock E2E value also includes framework dispatch. Mojo reports host wall time around enqueueing and synchronization. The E2E columns do not represent a common timing interval.
